@@ -1,0 +1,61 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Infyrence Docs",
+  "colors": {
+    "primary": "#005fd1",
+    "light": "#005fd1",
+    "dark": "#005fd1"
+  },
+  "favicon": {
+    "light": "/images/1.svg",
+    "dark": "/images/2.svg"
+  },
+  "navigation": {
+    "pages": [
+      {
+        "group": "Getting Started",
+        "pages": [
+          "index",
+          "quickstart"
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/images/inference-wordmark-black-color.svg",
+    "dark": "/images/inference-wordmark-white-color.svg",
+    "href": "https://infyrence.com"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Support",
+        "href": "mailto:hi@infyrence.com"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Dashboard",
+      "href": "https://app.mintlify.com"
+    }
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/Infyrence",
+      "linkedin": "https://linkedin.com/company/infyrence"
+    }
+  }
+}
