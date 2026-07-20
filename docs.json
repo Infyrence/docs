@@ -12,58 +12,97 @@
     "dark": "/images/2.svg"
   },
   "navigation": {
-    "pages": [
+    "tabs": [
       {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "installation",
-          "quickstart"
+        "tab": "Gateway",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "index",
+              "gateway/quickstart",
+              "gateway/authentication"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "gateway/models",
+              "gateway/streaming",
+              "gateway/byok",
+              "gateway/pricing-and-usage",
+              "gateway/rate-limits",
+              "gateway/errors"
+            ]
+          },
+          {
+            "group": "API reference",
+            "openapi": "api-reference/openapi.yaml",
+            "pages": [
+              "api-reference/create-chat-completion",
+              "api-reference/list-models",
+              "api-reference/gateway-status",
+              "api-reference/liveness"
+            ]
+          }
         ]
       },
       {
-        "group": "Core concepts",
-        "pages": [
-          "concepts/models",
-          "concepts/composition",
-          "concepts/structured-output",
-          "concepts/agents"
-        ]
-      },
-      {
-        "group": "Graph runtime",
-        "pages": [
-          "graph/overview",
-          "graph/checkpointing"
-        ]
-      },
-      {
-        "group": "Governance",
-        "pages": [
-          "governance/overview",
-          "governance/policy",
-          "governance/risk",
-          "governance/approval",
-          "governance/durable-approval",
-          "governance/audit"
-        ]
-      },
-      {
-        "group": "Integrations",
-        "pages": [
-          "integrations/overview",
-          "integrations/smolagents",
-          "integrations/langchain",
-          "integrations/openhands"
-        ]
-      },
-      {
-        "group": "Reference",
-        "pages": [
-          "providers",
-          "performance",
-          "architecture",
-          "open-core"
+        "tab": "Framework",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core concepts",
+            "pages": [
+              "concepts/models",
+              "concepts/composition",
+              "concepts/structured-output",
+              "concepts/agents"
+            ]
+          },
+          {
+            "group": "Graph runtime",
+            "pages": [
+              "graph/overview",
+              "graph/checkpointing"
+            ]
+          },
+          {
+            "group": "Governance",
+            "pages": [
+              "governance/overview",
+              "governance/policy",
+              "governance/risk",
+              "governance/approval",
+              "governance/durable-approval",
+              "governance/audit"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/overview",
+              "integrations/smolagents",
+              "integrations/langchain",
+              "integrations/openhands"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "providers",
+              "performance",
+              "architecture",
+              "open-core"
+            ]
+          }
         ]
       }
     ]
@@ -78,12 +117,16 @@
       {
         "label": "Support",
         "href": "mailto:hi@infyrence.com"
+      },
+      {
+        "label": "GitHub",
+        "href": "https://github.com/Infyrence"
       }
     ],
     "primary": {
       "type": "button",
       "label": "Dashboard",
-      "href": "https://app.infyrence.com"
+      "href": "https://www.infyrence.com/dashboard"
     }
   },
   "contextual": {

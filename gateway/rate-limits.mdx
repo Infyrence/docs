@@ -1,0 +1,222 @@
+---
+title: "Rate limits"
+description: "Limits, headers, and recommended retries."
+---
+
+The gateway rate limits requests per API key. When you exceed your limit, the gateway returns `429` with a `rate_limit_error`. This page covers the headers you get on every response, how to read a `429`, and the retry policy the official SDKs use.
+
+## How limiting works
+
+Rate limits are enforced per API key. Each request is checked against your key's request budget over a rolling window. When the budget is exhausted, the gateway rejects the request with status `429` until the window resets.
+
+<Info>
+  Limits are enforced hierarchically across your key, model, and provider, so a request can be limited at any of those tiers.
+</Info>
+
+## Rate limit headers
+
+Every response includes these headers, so you can track your budget without triggering a `429`.
+
+<ResponseField name="X-RateLimit-Limit" type="integer">
+  The maximum number of requests allowed in the current window.
+</ResponseField>
+
+<ResponseField name="X-RateLimit-Remaining" type="integer">
+  The number of requests left in the current window.
+</ResponseField>
+
+<ResponseField name="X-RateLimit-Reset" type="integer">
+  The number of seconds until the window resets and your remaining count is restored.
+</ResponseField>
+
+<Tip>
+  Watch `X-RateLimit-Remaining`. When it approaches `0`, slow your request rate so you reset cleanly instead of hitting a `429`.
+</Tip>
+
+## The 429 response
+
+When you exceed your limit, the gateway returns status `429` with a `rate_limit_error`. The response adds a `Retry-After` header telling you how many seconds to wait before retrying.
+
+```text
+HTTP/1.1 429 Too Many Requests
+Retry-After: 12
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 12
+X-Request-Id: 4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1
+Content-Type: application/json
+```
+
+```json
+{
+  "error": {
+    "message": "Rate limit exceeded. Please slow down.",
+    "type": "rate_limit_error",
+    "code": "rate_limited",
+    "request_id": "4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1"
+  }
+}
+```
+
+<ResponseField name="Retry-After" type="integer">
+  Seconds to wait before retrying. On a `429`, this matches `X-RateLimit-Reset`.
+</ResponseField>
+
+<Note>
+  The `request_id` field (and the `X-Request-Id` header) identify the failed request. Include it when contacting support.
+</Note>
+
+## Recommended retries
+
+Retry `429` responses with exponential backoff. The official SDKs apply this automatically. If you call the API directly, use the same policy.
+
+The gateway retries on these status codes, plus connection errors:
+
+| Status | Meaning |
+| --- | --- |
+| `429` | Rate limited |
+| `500` | Internal error |
+| `502` | Bad gateway |
+| `503` | Service unavailable |
+
+The backoff parameters are:
+
+<ParamField path="initialInterval" type="number" default="500">
+  The first wait, in milliseconds, before the initial retry.
+</ParamField>
+
+<ParamField path="maxInterval" type="number" default="30000">
+  The maximum wait, in milliseconds, between retries. Backoff never grows past this.
+</ParamField>
+
+<ParamField path="exponent" type="number" default="1.5">
+  The multiplier applied to the interval after each attempt.
+</ParamField>
+
+<ParamField path="maxElapsedTime" type="number" default="120000">
+  The total time, in milliseconds, to keep retrying before giving up.
+</ParamField>
+
+In practice: wait `500ms`, then multiply each wait by `1.5`, capping any single wait at `30s`, and stop retrying after `120s` total. Prefer the `Retry-After` value from a `429` when it is present.
+
+<Warning>
+  Do not retry `4xx` responses other than `429`. A `400`, `401`, `402`, or `404` will fail the same way on retry. Fix the request instead.
+</Warning>
+
+### Manual backoff example
+
+<CodeGroup>
+
+```python python
+import time
+import openai
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.infyrence.com/v1",
+    api_key="sk-...",
+)
+
+def create_with_retry(**kwargs):
+    delay = 0.5          # initialInterval: 500ms
+    max_delay = 30.0     # maxInterval: 30s
+    deadline = time.monotonic() + 120  # maxElapsedTime: 120s
+
+    while True:
+        try:
+            return client.chat.completions.create(**kwargs)
+        except openai.APIStatusError as err:
+            if err.status_code not in (429, 500, 502, 503):
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            retry_after = err.response.headers.get("retry-after")
+            wait = float(retry_after) if retry_after else delay
+            time.sleep(wait)
+            delay = min(delay * 1.5, max_delay)  # exponent: 1.5
+
+resp = create_with_retry(
+    model="claude-sonnet-5",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(resp.choices[0].message.content)
+```
+
+```javascript javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "https://api.infyrence.com/v1",
+  apiKey: "sk-...",
+});
+
+const RETRYABLE = new Set([429, 500, 502, 503]);
+
+async function createWithRetry(body) {
+  let delay = 500;                 // initialInterval: 500ms
+  const maxDelay = 30_000;         // maxInterval: 30s
+  const deadline = Date.now() + 120_000; // maxElapsedTime: 120s
+
+  while (true) {
+    try {
+      return await client.chat.completions.create(body);
+    } catch (err) {
+      if (!RETRYABLE.has(err.status) || Date.now() >= deadline) throw err;
+      const retryAfter = err.headers?.["retry-after"];
+      const wait = retryAfter ? Number(retryAfter) * 1000 : delay;
+      await new Promise((r) => setTimeout(r, wait));
+      delay = Math.min(delay * 1.5, maxDelay); // exponent: 1.5
+    }
+  }
+}
+
+const resp = await createWithRetry({
+  model: "claude-sonnet-5",
+  messages: [{ role: "user", content: "Hello" }],
+});
+console.log(resp.choices[0].message.content);
+```
+
+```bash curl
+# curl has no backoff logic, but --retry approximates it.
+# It retries transient failures with an increasing delay.
+curl https://api.infyrence.com/v1/chat/completions \
+  --retry 5 \
+  --retry-max-time 120 \
+  -H "Authorization: Bearer sk-..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-5",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+</CodeGroup>
+
+## Reduce rate limit errors
+
+<Steps>
+  <Step title="Read the headers">
+    Check `X-RateLimit-Remaining` on each response and throttle before you hit `0`.
+  </Step>
+  <Step title="Honor Retry-After">
+    On a `429`, wait the number of seconds in `Retry-After` before the next attempt.
+  </Step>
+  <Step title="Back off exponentially">
+    Retry only `429`, `500`, `502`, and `503`, growing the delay by `1.5` each time up to `30s`.
+  </Step>
+  <Step title="Spread out load">
+    Add jitter and avoid firing large bursts of concurrent requests at the same instant.
+  </Step>
+</Steps>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Errors" icon="triangle-exclamation" href="/gateway/errors">
+    Every error type, status code, and response shape.
+  </Card>
+  <Card title="Authentication" icon="key" href="/gateway/authentication">
+    Create and send your API key as a Bearer token.
+  </Card>
+</CardGroup>

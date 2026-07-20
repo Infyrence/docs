@@ -1,0 +1,563 @@
+openapi: 3.1.0
+info:
+  title: Infyrence API
+  version: 1.0.0
+  summary: Unified, OpenAI-compatible AI gateway for 200+ models.
+  description: |
+    Infyrence is a unified, OpenAI-compatible inference gateway. Call 200+ models
+    from every major provider through a single endpoint and one API key, with
+    automatic failover and edge-fast routing.
+
+    ## Authentication
+    Authenticate every request with your Infyrence API key as a Bearer token:
+
+    ```
+    Authorization: Bearer sk-...
+    ```
+
+    Create and manage keys in your [dashboard](https://www.infyrence.com/dashboard/api-keys).
+
+    ## OpenAI compatibility
+    The API mirrors the OpenAI Chat Completions API. To migrate an existing
+    integration, point the base URL at `https://api.infyrence.com/v1` and set the
+    `model` to any model from `GET /v1/models`, no other changes required.
+
+    ## Pricing
+    Billing is usage-based, per model: you pay for input and output tokens at each
+    model's published per-million-token rate. See
+    [infyrence.com/pricing](https://www.infyrence.com/pricing).
+  contact:
+    name: Infyrence Support
+    url: https://www.infyrence.com/contact
+    email: support@infyrence.com
+  license:
+    name: Proprietary
+    url: https://www.infyrence.com/terms
+  termsOfService: https://www.infyrence.com/terms
+
+servers:
+  - url: https://api.infyrence.com
+    description: Production
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Chat
+    description: Create model responses from a list of messages.
+  - name: Models
+    description: List the models available through the gateway.
+  - name: Health
+    description: Public liveness and status endpoints.
+
+# Speakeasy: retry idempotent failures and rate limits with backoff.
+x-speakeasy-retries:
+  strategy: backoff
+  backoff:
+    initialInterval: 500
+    maxInterval: 30000
+    maxElapsedTime: 120000
+    exponent: 1.5
+  statusCodes:
+    - 429
+    - 500
+    - 502
+    - 503
+  retryConnectionErrors: true
+
+paths:
+  /v1/chat/completions:
+    post:
+      tags: [Chat]
+      operationId: createChatCompletion
+      summary: Create a chat completion
+      description: |
+        Generate a model response for the given conversation. Set `stream: true`
+        to receive the response incrementally as Server-Sent Events (SSE).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionRequest"
+            examples:
+              basic:
+                summary: A simple completion
+                value:
+                  model: claude-sonnet-5
+                  messages:
+                    - role: system
+                      content: You are a helpful assistant.
+                    - role: user
+                      content: Explain quantum entanglement in one sentence.
+              streaming:
+                summary: A streaming completion
+                value:
+                  model: gpt-5.5
+                  messages:
+                    - role: user
+                      content: Write a haiku about the edge.
+                  stream: true
+      responses:
+        "200":
+          description: |
+            The chat completion. When `stream` is `false` (default), the body is a
+            single `ChatCompletionResponse` JSON object. When `stream` is `true`,
+            the body is a `text/event-stream` of `ChatCompletionChunk` objects , 
+            each sent as a `data: {...}` line, terminated by a final `data: [DONE]`.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionResponse"
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionChunk"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "402":
+          $ref: "#/components/responses/PaymentRequired"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/UpstreamUnavailable"
+
+  /v1/models:
+    get:
+      tags: [Models]
+      operationId: listModels
+      summary: List available models
+      description: List the models available to your account through the gateway.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The list of available models.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/health/providers:
+    get:
+      tags: [Health]
+      operationId: getStatus
+      summary: Gateway status
+      description: |
+        Public liveness for status pages. Returns `ok` when the gateway is
+        serving traffic, or `degraded` otherwise. Requires no authentication.
+      security: []
+      responses:
+        "200":
+          description: The current gateway status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayStatus"
+
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Liveness probe
+      description: Simple liveness check. Requires no authentication.
+      security: []
+      responses:
+        "200":
+          description: The service is live.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: sk-...
+      description: "Your Infyrence API key, sent as `Authorization: Bearer sk-...`."
+
+  headers:
+    X-Request-Id:
+      description: A unique id for the request, echoed on every response and included in error bodies for tracing.
+      schema:
+        type: string
+
+  schemas:
+    ChatMessage:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+          description: The role of the message author.
+        content:
+          type: [string, "null"]
+          description: The text content of the message. May be null for an assistant message that only issues tool calls.
+        name:
+          type: string
+          description: An optional name for the participant.
+        tool_calls:
+          type: array
+          description: Tool calls issued by the assistant, if any.
+          items:
+            $ref: "#/components/schemas/ToolCall"
+        tool_call_id:
+          type: string
+          description: For a `tool` message, the id of the tool call this message responds to.
+      additionalProperties: false
+
+    ToolCall:
+      type: object
+      required: [id, type, function]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          required: [name, arguments]
+          properties:
+            name:
+              type: string
+            arguments:
+              type: string
+              description: The function arguments as a JSON-encoded string.
+      additionalProperties: false
+
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: The model to use. Any id returned by `GET /v1/models`.
+          examples: [claude-sonnet-5, gpt-5.5, gemini-3.1-pro]
+        messages:
+          type: array
+          minItems: 1
+          description: The conversation so far, as a list of messages.
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          description: Sampling temperature. Higher is more random.
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Nucleus sampling probability mass.
+        max_tokens:
+          type: integer
+          minimum: 1
+          description: Maximum number of tokens to generate in the completion.
+        stream:
+          type: boolean
+          default: false
+          description: If true, stream the response as Server-Sent Events.
+        stop:
+          description: Up to a few sequences where generation stops.
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        frequency_penalty:
+          type: number
+          minimum: -2
+          maximum: 2
+          description: Penalize new tokens by their existing frequency in the text so far.
+        presence_penalty:
+          type: number
+          minimum: -2
+          maximum: 2
+          description: Penalize new tokens by whether they already appear in the text so far.
+        n:
+          type: integer
+          minimum: 1
+          description: Number of completions to generate.
+        seed:
+          type: integer
+          description: Best-effort deterministic sampling seed.
+      additionalProperties: false
+
+    Usage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+
+    ChatCompletionChoice:
+      type: object
+      required: [index, message, finish_reason]
+      properties:
+        index:
+          type: integer
+        message:
+          $ref: "#/components/schemas/ChatMessage"
+        finish_reason:
+          type: [string, "null"]
+          enum: [stop, length, tool_calls, null]
+
+    ChatCompletionResponse:
+      type: object
+      required: [id, object, created, model, choices, usage]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: chat.completion
+        created:
+          type: integer
+          description: Unix timestamp (seconds) of when the completion was created.
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatCompletionChoice"
+        usage:
+          $ref: "#/components/schemas/Usage"
+
+    ChatCompletionChunkChoice:
+      type: object
+      required: [index, delta, finish_reason]
+      properties:
+        index:
+          type: integer
+        delta:
+          $ref: "#/components/schemas/ChatMessage"
+        finish_reason:
+          type: [string, "null"]
+          enum: [stop, length, tool_calls, null]
+
+    ChatCompletionChunk:
+      type: object
+      description: One streamed chunk of a chat completion, sent as an SSE `data:` line.
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: chat.completion.chunk
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatCompletionChunkChoice"
+        usage:
+          $ref: "#/components/schemas/Usage"
+
+    ModelInfo:
+      type: object
+      required: [id, object, created, owned_by, capabilities]
+      properties:
+        id:
+          type: string
+          description: The model id to pass as `model` in a request.
+        object:
+          type: string
+          const: model
+        created:
+          type: integer
+        owned_by:
+          type: string
+        capabilities:
+          type: object
+          required: [chat, completions, embeddings]
+          properties:
+            chat:
+              type: boolean
+            completions:
+              type: boolean
+            embeddings:
+              type: boolean
+
+    ModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelInfo"
+
+    GatewayStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+
+    Health:
+      type: object
+      required: [status, timestamp]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        timestamp:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type]
+          properties:
+            message:
+              type: string
+              description: A human-readable description of the error.
+            type:
+              type: string
+              description: The category of error, e.g. `invalid_request_error`, `authentication_error`, `rate_limit_error`, `upstream_error`.
+            code:
+              type: [string, "null"]
+              description: A stable, machine-readable error code, when available.
+            request_id:
+              type: string
+              description: The id of the failed request, for tracing with support.
+      additionalProperties: false
+
+  responses:
+    BadRequest:
+      description: The request was malformed or failed validation.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: "messages: Required"
+              type: invalid_request_error
+              code: null
+              request_id: 4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1
+    Unauthorized:
+      description: The API key is missing or invalid.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: Invalid API key.
+              type: authentication_error
+              code: invalid_api_key
+              request_id: 4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1
+    PaymentRequired:
+      description: The account has no remaining balance for platform models. Add funds, or use your own provider key (BYOK).
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: Insufficient balance. Add funds, or use your own provider key (BYOK) to continue.
+              type: insufficient_credits
+              code: null
+              request_id: 4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1
+    NotFound:
+      description: The requested model or resource was not found.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: The requested model was not found.
+              type: not_found
+              code: model_not_found
+              request_id: 4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1
+    RateLimited:
+      description: Too many requests. Retry after the interval in the `Retry-After` header.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+        X-RateLimit-Limit:
+          schema:
+            type: integer
+        X-RateLimit-Remaining:
+          schema:
+            type: integer
+        X-RateLimit-Reset:
+          schema:
+            type: integer
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: Rate limit exceeded. Please slow down.
+              type: rate_limit_error
+              code: rate_limited
+              request_id: 4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1
+    UpstreamUnavailable:
+      description: The model is temporarily unavailable. Retry after a short delay.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: The model is temporarily unavailable. Please try again in a few moments.
+              type: upstream_error
+              code: upstream_unavailable
+              request_id: 4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1

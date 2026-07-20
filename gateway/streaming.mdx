@@ -1,0 +1,250 @@
+---
+title: "Streaming"
+description: "Stream responses as server-sent events."
+---
+
+Set `stream: true` on a chat completion to receive the response incrementally as server-sent events (SSE). Instead of waiting for the full completion, you get a series of small `ChatCompletionChunk` objects as the model generates tokens, so you can render output as it arrives.
+
+Streaming works with any model on the gateway, and with the OpenAI SDK you already use. Point the SDK at `https://api.infyrence.com/v1` and pass `stream=True`.
+
+<Note>
+  Streaming uses the same `POST /v1/chat/completions` endpoint as a normal request. The only difference is the `stream` field and the response format.
+</Note>
+
+## How it works
+
+When you set `stream: true`, the gateway responds with `Content-Type: text/event-stream` and writes each chunk as a single SSE line:
+
+```text
+data: {"id":"...","object":"chat.completion.chunk","choices":[...]}
+```
+
+Each `data:` line contains one JSON `ChatCompletionChunk`. After the final chunk, the gateway writes a terminator line and closes the connection:
+
+```text
+data: [DONE]
+```
+
+The literal `data: [DONE]` marker is not JSON. Use it to know the stream is finished. It is always sent, including after an error, so a client that blocks on the terminator closes cleanly.
+
+The gateway also sets `Cache-Control: no-cache` and `Connection: keep-alive` on the streamed response.
+
+## Request
+
+Send a normal chat completion request with `stream` set to `true`.
+
+<ParamField path="stream" type="boolean" default="false">
+  If `true`, the gateway streams the response as server-sent events. If omitted or `false`, the gateway returns a single `ChatCompletionResponse` JSON object.
+</ParamField>
+
+All other fields (`model`, `messages`, `temperature`, `max_tokens`, and the rest) work exactly as they do for a non-streaming request. See the [chat completions reference](/api-reference/create-chat-completion) for the full list.
+
+## Chunk shape
+
+Each event's `data:` payload is a `ChatCompletionChunk` object.
+
+<ResponseField name="id" type="string">
+  An id for the completion. The same id is repeated across every chunk in the stream.
+</ResponseField>
+
+<ResponseField name="object" type="string">
+  Always `chat.completion.chunk`.
+</ResponseField>
+
+<ResponseField name="created" type="integer">
+  Unix timestamp (seconds) of when the completion was created.
+</ResponseField>
+
+<ResponseField name="model" type="string">
+  The model that produced the chunk.
+</ResponseField>
+
+<ResponseField name="choices" type="array">
+  A list of chunk choices. Each has an `index`, a `delta`, and a `finish_reason`.
+
+  <Expandable title="choice fields">
+    <ResponseField name="index" type="integer">
+      The index of the choice this chunk belongs to.
+    </ResponseField>
+    <ResponseField name="delta" type="object">
+      The incremental update for this choice. A `delta` has the same shape as a `ChatMessage`, but only carries the parts that changed in this chunk. The first chunk typically sets `role` (`assistant`), and later chunks carry `content` fragments. A `delta` may also include `tool_calls` when the model is issuing a tool call.
+    </ResponseField>
+    <ResponseField name="finish_reason" type="string | null">
+      `null` while the model is still generating. On the final content chunk it is one of `stop`, `length`, or `tool_calls`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="usage" type="object">
+  Token usage for the completion (`prompt_tokens`, `completion_tokens`, `total_tokens`). Present on the usage-bearing chunk near the end of the stream.
+</ResponseField>
+
+To reconstruct the full message, concatenate `choices[0].delta.content` across all chunks in order.
+
+### Example chunks
+
+The first chunk opens the message with a role:
+
+```json
+{
+  "id": "chatcmpl_abc123",
+  "object": "chat.completion.chunk",
+  "created": 1770000000,
+  "model": "claude-sonnet-5",
+  "choices": [
+    { "index": 0, "delta": { "role": "assistant", "content": "" }, "finish_reason": null }
+  ]
+}
+```
+
+Subsequent chunks carry content fragments:
+
+```json
+{
+  "id": "chatcmpl_abc123",
+  "object": "chat.completion.chunk",
+  "created": 1770000000,
+  "model": "claude-sonnet-5",
+  "choices": [
+    { "index": 0, "delta": { "content": "Hello" }, "finish_reason": null }
+  ]
+}
+```
+
+The final content chunk sets a `finish_reason`:
+
+```json
+{
+  "id": "chatcmpl_abc123",
+  "object": "chat.completion.chunk",
+  "created": 1770000000,
+  "model": "claude-sonnet-5",
+  "choices": [
+    { "index": 0, "delta": {}, "finish_reason": "stop" }
+  ]
+}
+```
+
+Then the stream ends:
+
+```text
+data: [DONE]
+```
+
+## Examples
+
+The OpenAI SDKs parse the SSE stream and the `data: [DONE]` terminator for you, so you iterate over chunk objects directly.
+
+<CodeGroup>
+
+```python python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.infyrence.com/v1",
+    api_key="sk-...",
+)
+
+stream = client.chat.completions.create(
+    model="claude-sonnet-5",
+    messages=[{"role": "user", "content": "Write a haiku about routing."}],
+    stream=True,
+)
+
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if delta.content:
+        print(delta.content, end="", flush=True)
+print()
+```
+
+```javascript javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "https://api.infyrence.com/v1",
+  apiKey: "sk-...",
+});
+
+const stream = await client.chat.completions.create({
+  model: "claude-sonnet-5",
+  messages: [{ role: "user", content: "Write a haiku about routing." }],
+  stream: true,
+});
+
+for await (const chunk of stream) {
+  const delta = chunk.choices[0]?.delta?.content;
+  if (delta) process.stdout.write(delta);
+}
+process.stdout.write("\n");
+```
+
+```bash curl
+curl https://api.infyrence.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-..." \
+  -H "Content-Type: application/json" \
+  -N \
+  -d '{
+    "model": "claude-sonnet-5",
+    "messages": [{"role": "user", "content": "Write a haiku about routing."}],
+    "stream": true
+  }'
+```
+
+</CodeGroup>
+
+<Tip>
+  Pass `-N` (`--no-buffer`) to curl so it prints each event as it arrives instead of buffering the whole response.
+</Tip>
+
+## Parsing the stream yourself
+
+If you consume the raw HTTP response instead of an SDK, follow the SSE format:
+
+<Steps>
+  <Step title="Read the response line by line">
+    The body is a `text/event-stream`. Each event is a line that starts with `data: `.
+  </Step>
+  <Step title="Check for the terminator">
+    If the line is `data: [DONE]`, the stream is complete. Stop reading. Do not try to parse `[DONE]` as JSON.
+  </Step>
+  <Step title="Parse each data line as JSON">
+    For every other `data:` line, parse the remainder as a `ChatCompletionChunk` and read `choices[0].delta`.
+  </Step>
+  <Step title="Accumulate the content">
+    Append each `delta.content` to build the full message, and stop once you see a non-null `finish_reason` followed by `data: [DONE]`.
+  </Step>
+</Steps>
+
+## Errors during a stream
+
+The HTTP status is `200` as soon as the stream opens, so an error that happens mid-stream cannot change the status code. Instead, the gateway emits a final error event and then the `[DONE]` terminator:
+
+```text
+data: {"error":{"message":"...","type":"upstream_error","code":"upstream_unavailable"}}
+
+data: [DONE]
+```
+
+Guard against this by checking each parsed chunk for an `error` field before reading `choices`. Every error body includes a request id, also returned in the `X-Request-Id` header, which you can quote when contacting support.
+
+<Warning>
+  Errors that occur before the stream opens (for example an invalid request or an empty balance) are returned as a normal JSON error response with the appropriate status code, not as an SSE event. See [Errors](/gateway/errors) for the full list.
+</Warning>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Chat completions" icon="message" href="/api-reference/create-chat-completion">
+    The full request and response schema for `/v1/chat/completions`.
+  </Card>
+  <Card title="Models" icon="layer-group" href="/gateway/models">
+    List every model id you can stream from.
+  </Card>
+  <Card title="Errors" icon="triangle-exclamation" href="/gateway/errors">
+    Error types, codes, and status codes.
+  </Card>
+  <Card title="Quickstart" icon="bolt" href="/gateway/quickstart">
+    Point your OpenAI SDK at the gateway in one step.
+  </Card>
+</CardGroup>

@@ -1,0 +1,190 @@
+---
+title: "Pricing and usage"
+description: "How usage-based billing and the usage object work."
+---
+
+Billing is usage-based and per model. You pay for the input and output tokens of each request at the served model's published per-million-token rate. There are no seats, no tiers, and no minimums. You are billed only for what you call.
+
+<Info>
+  Prices are set per model and published on the [pricing page](https://www.infyrence.com/pricing). Rates differ by model and by provider, so always check the current rate for the model id you plan to call.
+</Info>
+
+## How a request is priced
+
+Every chat completion returns a `usage` object. Your cost for that request is computed from those token counts and the model's rates:
+
+```text
+cost_usd = (prompt_tokens / 1,000,000) * input_rate_per_million
+         + (completion_tokens / 1,000,000) * output_rate_per_million
+```
+
+The result is rounded to six decimal places (micro-dollar precision), then deducted from your organization's USD balance.
+
+- `prompt_tokens` are your input tokens (the messages you send), billed at the model's input rate.
+- `completion_tokens` are the model's output tokens, billed at the model's output rate.
+
+Input and output are priced separately, so a model can charge a different rate for each. Refer to the [pricing page](https://www.infyrence.com/pricing) for both rates per model.
+
+## The usage object
+
+Every non-streaming completion response includes a `usage` object. All three fields are always present and are integers.
+
+<ResponseField name="usage" type="object">
+  Token accounting for the request.
+
+  <Expandable title="properties">
+    <ResponseField name="prompt_tokens" type="integer">
+      Number of input tokens in the request.
+    </ResponseField>
+    <ResponseField name="completion_tokens" type="integer">
+      Number of output tokens generated in the response.
+    </ResponseField>
+    <ResponseField name="total_tokens" type="integer">
+      Sum of `prompt_tokens` and `completion_tokens`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+A typical response body looks like this:
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1730000000,
+  "model": "claude-sonnet-5",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "Hello!" },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 8,
+    "total_tokens": 20
+  }
+}
+```
+
+You can read `usage` directly from the SDK response to track spend in your own app:
+
+<CodeGroup>
+
+```python python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.infyrence.com/v1",
+    api_key="sk-...",
+)
+
+resp = client.chat.completions.create(
+    model="claude-sonnet-5",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+
+print(resp.usage.prompt_tokens)      # input tokens
+print(resp.usage.completion_tokens)  # output tokens
+print(resp.usage.total_tokens)       # sum of both
+```
+
+```javascript javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "https://api.infyrence.com/v1",
+  apiKey: "sk-...",
+});
+
+const resp = await client.chat.completions.create({
+  model: "claude-sonnet-5",
+  messages: [{ role: "user", content: "Hello!" }],
+});
+
+console.log(resp.usage.prompt_tokens);     // input tokens
+console.log(resp.usage.completion_tokens); // output tokens
+console.log(resp.usage.total_tokens);      // sum of both
+```
+
+```bash curl
+curl https://api.infyrence.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-5",
+    "messages": [{ "role": "user", "content": "Hello!" }]
+  }'
+```
+
+</CodeGroup>
+
+<Note>
+  Streaming responses also carry a `usage` object on the final chunk, so you get the same accounting whether or not you stream.
+</Note>
+
+## Balance and deduction
+
+Your balance is denominated in USD. When a request completes, its cost is deducted from your organization's balance in a single atomic operation. Concurrent requests cannot race each other, and your balance is clamped at zero, so it can never go negative.
+
+When your balance is exhausted, calls to platform-billed models fail with `402` and an error of type `insufficient_credits`:
+
+```json
+{
+  "error": {
+    "message": "Insufficient balance. Add funds, or use your own provider key (BYOK) to continue.",
+    "type": "insufficient_credits",
+    "code": null,
+    "request_id": "4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1"
+  }
+}
+```
+
+To recover, add funds in the [dashboard](https://www.infyrence.com/dashboard/api-keys) or switch the request to your own provider key (see BYOK below).
+
+## BYOK versus platform balance
+
+You can run requests two ways.
+
+<CardGroup cols={2}>
+  <Card title="Platform balance" icon="wallet">
+    Infyrence calls the provider for you and deducts the request cost from your USD balance at the model's published rate. This is the default.
+  </Card>
+  <Card title="Bring your own key (BYOK)" icon="key">
+    The request runs on your own provider key. Infyrence routes it but does not charge your balance. BYOK requests cost `$0` in platform credits.
+  </Card>
+</CardGroup>
+
+<Tip>
+  BYOK is useful when you already hold provider credits or committed-use discounts. You keep those rates and still get one unified endpoint, one Infyrence key, and automatic failover.
+</Tip>
+
+## Models with no published rate
+
+Billing fails safe. If a requested model is not in the pricing catalog, the request is charged `$0` rather than an unknown or default amount. A pricing gap can never overcharge you. Prices are cached briefly on the edge and refresh automatically, so newly listed rates take effect within minutes.
+
+## Where to see your spend
+
+<Steps>
+  <Step title="Per request, in code">
+    Read the `usage` object from each response and total it in your application.
+  </Step>
+  <Step title="In the request logs">
+    Each request is logged with its model, token counts, status, latency, and the USD charged. Use logs to attribute spend to specific calls and API keys.
+  </Step>
+  <Step title="In the dashboard">
+    View your balance, aggregate usage, and per-model spend in the [dashboard](https://www.infyrence.com/dashboard/api-keys).
+  </Step>
+</Steps>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Browse models and rates" icon="layer-group" href="/gateway/models">
+    List the live catalog with `GET /v1/models` and look up per-model rates.
+  </Card>
+  <Card title="Pricing page" icon="tag" href="https://www.infyrence.com/pricing">
+    See the current per-million-token rate for every model.
+  </Card>
+</CardGroup>

@@ -1,0 +1,173 @@
+---
+title: "Bring your own key"
+description: "Use your own provider keys through the gateway."
+---
+
+<Info>
+  BYOK lets you route a request through your own upstream provider API key instead of your Infyrence platform balance. You keep the same OpenAI-compatible endpoint, the same single Infyrence API key, and the same failover and logging. Only the billing path changes: BYOK requests draw on your provider account, not your platform credits.
+</Info>
+
+## How it works
+
+Every request still goes to `https://api.infyrence.com/v1/chat/completions` with your Infyrence API key. Nothing in your client code changes.
+
+Behind that endpoint, the gateway resolves which upstream provider serves the model you asked for (for example `claude-sonnet-5` resolves to Anthropic). If your organization has stored an active credential for that provider, the gateway uses your key for the upstream call. If not, the request runs on platform balance as usual.
+
+<Steps>
+  <Step title="You send a request">
+    A normal chat completion, authenticated with your Infyrence key as a Bearer token.
+  </Step>
+  <Step title="The gateway resolves the provider">
+    The model id determines the upstream provider that would serve it.
+  </Step>
+  <Step title="The gateway checks for a BYOK credential">
+    If your org has an `active` stored credential for that resolved provider, the gateway builds a provider instance from your decrypted key and routes the upstream call through it.
+  </Step>
+  <Step title="Billing follows the path">
+    A BYOK request bills to your provider account. A platform request bills to your Infyrence balance at the model's published rate.
+  </Step>
+</Steps>
+
+## Selection: BYOK vs platform balance
+
+Selection is per request and per resolved provider. The gateway does not use a header or request field to pick BYOK. It looks at the provider that the requested model resolves to, then checks whether your org has a stored credential for that exact provider.
+
+<CardGroup cols={2}>
+  <Card title="BYOK credential exists" icon="key">
+    The resolved provider has an `active` credential for your org. The upstream call uses your key. No platform credits are charged. The request proceeds even if your platform balance is zero.
+  </Card>
+  <Card title="No BYOK credential" icon="wallet">
+    The resolved provider has no stored credential for your org. The request runs on platform balance and is billed at the model's per-million-token rate.
+  </Card>
+</CardGroup>
+
+<Note>
+  BYOK is scoped to the resolved provider, not to your whole account. If one model resolves to a provider you have a BYOK key for and another model resolves to a provider you do not, the first request uses your key and the second uses platform balance. Mixed usage across models in the same app is expected and handled automatically.
+</Note>
+
+### Credit gate and the 402 response
+
+The credit check is deliberately narrow so BYOK works at zero balance. The gateway blocks a request only when both of these are true:
+
+- The resolved provider has no BYOK credential for your org.
+- Your current platform balance is at or below zero.
+
+In that case the gateway returns `402` with this body:
+
+```json
+{
+  "error": {
+    "message": "Insufficient balance. Add funds, or use your own provider key (BYOK) to continue.",
+    "type": "insufficient_credits"
+  }
+}
+```
+
+<Warning>
+  A `402 insufficient_credits` response means the model you requested would have hit a platform provider and you have no credits. Either add funds, store a BYOK credential for that provider, or call a model that resolves to a provider you already have a BYOK key for.
+</Warning>
+
+If the resolved provider does have your BYOK credential, the balance check is skipped entirely, so a zero-balance org can keep making BYOK calls without interruption.
+
+## Setup
+
+You add and manage provider credentials in the dashboard. The gateway reads them from your org's stored, encrypted credentials at request time. There is no request-side configuration to add.
+
+<Steps>
+  <Step title="Open the dashboard">
+    Go to your [API keys and credentials](https://www.infyrence.com/dashboard/api-keys) in the dashboard.
+  </Step>
+  <Step title="Store a provider credential">
+    Add your own upstream provider API key. Credentials are stored encrypted and scoped to your organization.
+  </Step>
+  <Step title="Send requests as usual">
+    Once a credential is `active`, requests that resolve to that provider route through your key automatically.
+  </Step>
+</Steps>
+
+<Note>
+  BYOK is available when platform encryption is enabled for the environment. When it is not, no BYOK credentials are loaded and every request runs on platform balance. Contact support if BYOK does not appear in your dashboard.
+</Note>
+
+## Your client code does not change
+
+BYOK is transparent to the caller. Point an OpenAI SDK at the Infyrence base URL and send requests normally. Whether a request uses your provider key or platform balance is decided server side.
+
+<CodeGroup>
+
+```bash curl
+curl https://api.infyrence.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-5",
+    "messages": [{ "role": "user", "content": "Hello" }]
+  }'
+```
+
+```python python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.infyrence.com/v1",
+    api_key="sk-...",
+)
+
+# If your org has an active credential for the provider that
+# claude-sonnet-5 resolves to, this call uses your key.
+resp = client.chat.completions.create(
+    model="claude-sonnet-5",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(resp.choices[0].message.content)
+```
+
+```javascript javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "https://api.infyrence.com/v1",
+  apiKey: "sk-...",
+});
+
+const resp = await client.chat.completions.create({
+  model: "claude-sonnet-5",
+  messages: [{ role: "user", content: "Hello" }],
+});
+console.log(resp.choices[0].message.content);
+```
+
+</CodeGroup>
+
+## Reliability
+
+BYOK does not weaken the gateway's robustness.
+
+- **Failover still applies.** BYOK changes which key serves the upstream call, not the routing and retry behavior.
+- **A bad credential never breaks a request.** If one stored credential cannot be decrypted or built, the gateway logs it server side and continues. That provider simply falls back to platform behavior for the request.
+- **Logging is unchanged.** Every request is recorded with token usage, latency, status, the provider that served it, and whether it was a BYOK call, so BYOK and platform traffic sit side by side in your dashboard.
+
+<Accordion title="Why did my request use platform balance when I have a BYOK key?">
+  The model you called resolved to a different provider than the one you stored a credential for. BYOK selection matches on the resolved provider exactly. Confirm which provider your model resolves to, then store a credential for that provider. Use `GET /v1/models` for the live model list.
+</Accordion>
+
+<Accordion title="Is my provider key exposed to clients?">
+  No. Credentials are stored encrypted and decrypted only in memory on the server at request time. The upstream provider attribution is stripped from responses and never leaked to clients.
+</Accordion>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Models" icon="layer-group" href="/gateway/models">
+    List available models and see which provider each resolves to.
+  </Card>
+  <Card title="Pricing" icon="tag" href="https://www.infyrence.com/pricing">
+    Per-model, per-million-token rates for platform-balance requests.
+  </Card>
+  <Card title="Authentication" icon="lock" href="/gateway/authentication">
+    Create and send your Infyrence API key.
+  </Card>
+  <Card title="Errors" icon="triangle-exclamation" href="/gateway/errors">
+    Status codes and error types, including `402 insufficient_credits`.
+  </Card>
+</CardGroup>

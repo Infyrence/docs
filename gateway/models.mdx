@@ -1,0 +1,223 @@
+---
+title: "Models and providers"
+description: "Discover and select models across providers."
+---
+
+Infyrence gives you one endpoint and one API key for 200+ models across every major provider. You select a model by passing its id as the `model` field. The gateway routes each request to a healthy upstream that serves that model, so your integration never talks to individual providers directly.
+
+<Info>
+The base URL is `https://api.infyrence.com/v1`. Point any OpenAI SDK at it and set `model` to any id returned by `GET /v1/models`. No other code change is needed.
+</Info>
+
+## List available models
+
+Call `GET /v1/models` to get the models available to your account. The response is a `list` of `ModelInfo` objects, matching the shape of the OpenAI models endpoint.
+
+<CodeGroup>
+
+```bash curl
+curl https://api.infyrence.com/v1/models \
+  -H "Authorization: Bearer sk-..."
+```
+
+```python python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.infyrence.com/v1",
+    api_key="sk-...",
+)
+
+models = client.models.list()
+for m in models.data:
+    print(m.id)
+```
+
+```javascript javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "https://api.infyrence.com/v1",
+  apiKey: "sk-...",
+});
+
+const models = await client.models.list();
+for (const m of models.data) {
+  console.log(m.id);
+}
+```
+
+</CodeGroup>
+
+<Note>
+Create and manage keys in the [dashboard](https://www.infyrence.com/dashboard/api-keys). Send yours as a Bearer token: `Authorization: Bearer sk-...`. A missing or invalid key returns `401`.
+</Note>
+
+### Example response
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "claude-sonnet-5",
+      "object": "model",
+      "created": 1735689600,
+      "owned_by": "infyrence",
+      "capabilities": {
+        "chat": true,
+        "completions": true,
+        "embeddings": false
+      }
+    },
+    {
+      "id": "gpt-5.5",
+      "object": "model",
+      "created": 1735689600,
+      "owned_by": "infyrence",
+      "capabilities": {
+        "chat": true,
+        "completions": true,
+        "embeddings": false
+      }
+    },
+    {
+      "id": "gemini-3.1-pro",
+      "object": "model",
+      "created": 1735689600,
+      "owned_by": "infyrence",
+      "capabilities": {
+        "chat": true,
+        "completions": true,
+        "embeddings": false
+      }
+    }
+  ]
+}
+```
+
+## Response fields
+
+Each entry in `data` is a `ModelInfo` object.
+
+<ResponseField name="id" type="string">
+  The model id. Pass this exact value as the `model` field in a request.
+</ResponseField>
+
+<ResponseField name="object" type="string">
+  Always `model`.
+</ResponseField>
+
+<ResponseField name="created" type="integer">
+  A Unix timestamp for the model entry.
+</ResponseField>
+
+<ResponseField name="owned_by" type="string">
+  Always `infyrence`. The gateway presents a single, generic owner and does not disclose which upstream provider serves a given model.
+</ResponseField>
+
+<ResponseField name="capabilities" type="object">
+  Which request surfaces the model supports. Each field is a boolean.
+
+  <Expandable title="capabilities">
+    <ResponseField name="chat" type="boolean">
+      The model can be used with `POST /v1/chat/completions`.
+    </ResponseField>
+    <ResponseField name="completions" type="boolean">
+      The model can be used with the legacy completions surface.
+    </ResponseField>
+    <ResponseField name="embeddings" type="boolean">
+      The model can be used to generate embeddings.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<Tip>
+The model list is live. New models become available without any change to your code, so call `GET /v1/models` at runtime rather than hardcoding a list.
+</Tip>
+
+## Selecting a model
+
+You choose a model per request through the `model` field. The value must be an id returned by `GET /v1/models`.
+
+```python
+resp = client.chat.completions.create(
+    model="claude-sonnet-5",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+If you pass a model id the gateway cannot route, the request returns `404` with a `not_found` error and code `model_not_found`. Every response, including errors, carries an `X-Request-Id` header you can use for tracing.
+
+<Warning>
+Model ids are case-sensitive and namespaced exactly as listed. Some ids include a vendor prefix (for example `meta-llama/...` or `deepseek-ai/...`). Copy the id verbatim from `GET /v1/models`.
+</Warning>
+
+## Provider coverage
+
+A single Infyrence key reaches models from every major provider through one OpenAI-compatible surface. The gateway maps each `model` id to a provider that serves it, so you never manage separate SDKs, base URLs, or keys per provider.
+
+Because `owned_by` is always `infyrence`, you select by capability and model id, not by upstream. Use `capabilities` to filter for what you need (chat, completions, or embeddings).
+
+### Bring your own key (BYOK)
+
+Instead of drawing on your platform balance, you can attach your own provider key and have the gateway route eligible requests through it. BYOK is supported for these providers:
+
+<CodeGroup>
+
+```text providers
+openai
+anthropic
+groq
+xai
+deepseek
+mistral
+together
+cerebras
+alibaba
+nvidia
+openrouter
+```
+
+</CodeGroup>
+
+<Note>
+BYOK covers billing and provider access, not the request shape. You still call the same `https://api.infyrence.com/v1` endpoint with the same `model` ids. See [Pricing](https://www.infyrence.com/pricing) for platform rates and how BYOK affects billing.
+</Note>
+
+## Failover routing
+
+When more than one healthy upstream can serve a model, the gateway picks one for you and fails over if it is unavailable. You do not configure this: it is automatic and transparent to your integration.
+
+<Steps>
+  <Step title="Match the model to a provider">
+    The gateway resolves the `model` id to every registered provider that serves it, using exact model lists plus prefix matching so newly published models stay routable.
+  </Step>
+  <Step title="Prefer a healthy, dedicated upstream">
+    Dedicated providers are preferred over broad aggregators, so a request lands on the most specific healthy upstream available for that model.
+  </Step>
+  <Step title="Retry and fall back on failure">
+    If an upstream returns a transient error such as `429` (rate limited) or `503` (temporarily unavailable), the gateway retries, honors any `Retry-After`, and falls back to another upstream that serves the same model.
+  </Step>
+</Steps>
+
+<Info>
+A `429` response includes a `Retry-After` header (seconds to wait) along with `X-RateLimit-*` headers. A `503` means the model is temporarily unavailable: retry after a short delay. Both responses include `X-Request-Id`.
+</Info>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Create a chat completion" icon="message" href="/api-reference/create-chat-completion">
+    Send a request to a selected model.
+  </Card>
+  <Card title="Authentication" icon="key" href="/gateway/authentication">
+    Create a key and send it as a Bearer token.
+  </Card>
+  <Card title="Errors" icon="triangle-exclamation" href="/gateway/errors">
+    Handle `401`, `404`, `429`, and `503` responses.
+  </Card>
+  <Card title="Pricing" icon="tag" href="https://www.infyrence.com/pricing">
+    See per-model, per-token rates and BYOK billing.
+  </Card>
+</CardGroup>

@@ -1,0 +1,155 @@
+---
+title: "Introduction"
+description: "The zero-dependency, governable framework for AI agents."
+---
+
+infy is a from-scratch runtime for LLM applications and agentic systems. The Python core has no third-party runtime dependencies. The hot paths (JSON parsing, similarity, tokenization) are accelerated by a compiled Rust extension that degrades gracefully to pure Python when it is absent. You get a complete chat-model abstraction, composable runnables, structured output, tool-calling agents, and a Pregel-style stateful graph executor with checkpointing and human-in-the-loop interrupts, sync and async throughout.
+
+It is LangGraph-compatible and Apache-2.0, open core.
+
+## Two things set it apart
+
+<CardGroup cols={2}>
+  <Card title="Weight" icon="feather">
+    infy targets the costs that show up in production: cold-start latency, memory footprint, and per-invocation overhead. Across a corpus of about 37 real agents it runs a median of **8.6x faster on cold start** and **5.4x lighter on memory** at line-of-code parity.
+  </Card>
+  <Card title="Control" icon="shield-check">
+    An optional, in-process governance layer policy-checks every tool call and writes a tamper-evident audit. You can give an agent real authority (shell, deploys, money, customer data) safely, and prove what it did. The same governance wraps agents built on other frameworks.
+  </Card>
+</CardGroup>
+
+## Install
+
+```bash
+pip install infy                 # core + Rust extension (pure-Python fallback if unavailable)
+pip install "infy[openai]"       # OpenAI provider
+pip install "infy[anthropic]"    # Anthropic provider
+pip install "infy[gemini]"       # Google Gemini / Vertex provider
+pip install "infy[ollama]"       # Ollama provider
+pip install "infy[pydantic]"     # validated structured output
+pip install "infy[all]"          # all providers
+```
+
+Requires Python 3.10+.
+
+<Note>
+  infy is alpha. Until the first tagged PyPI release, install from source. The model, runnable, structured-output, tool, agent, graph, governance, and integration APIs are stable and covered by the test suite. Treat minor releases as potentially breaking until 1.0.
+</Note>
+
+## A first agent
+
+```python
+from infy import create_agent, tool
+from infy.providers.openai import OpenAIChat
+
+model = OpenAIChat("gpt-4o")
+
+@tool
+def get_weather(city: str) -> str:
+    """Return the current weather for a city."""
+    return f"{city}: 17C, clear"
+
+agent = create_agent(model, tools=[get_weather])     # create_async_agent for async
+result = agent("What's the weather in Boston?")
+
+print(result.response.text)
+print(result.iterations, result.tool_calls_made)
+```
+
+`create_agent` is a tight ReAct loop with tool calls executed in parallel by default. When you need control flow that branches, loops, persists, or pauses, reach for the graph runtime.
+
+## The pillars
+
+<CardGroup cols={2}>
+  <Card title="Models" icon="plug">
+    A single `ChatModel` protocol (`generate`, `agenerate`, `stream`, `astream`, `bind_tools`, `with_structured_output`) across OpenAI, Anthropic, Gemini / Vertex, and Ollama. Providers are interchangeable in chains, agents, and graphs.
+  </Card>
+  <Card title="Composition" icon="link">
+    Runnables compose with the `|` operator into a `Sequence`. Plain callables, dicts, and tools are coerced automatically. Every chain is both sync (`invoke`) and async (`ainvoke`).
+  </Card>
+  <Card title="Agents" icon="robot">
+    `create_agent` gives you a ReAct loop with parallel tool execution, structured results, and optional governance wired straight into the tool chokepoint.
+  </Card>
+  <Card title="Graph" icon="diagram-project">
+    `StateGraph` compiles to a bulk-synchronous superstep executor with typed channels, reducers, conditional routing, dynamic fan-out, checkpointing, and interrupt or resume.
+  </Card>
+  <Card title="Governance" icon="shield-halved">
+    Deny-by-default policy, risk tiering, human approval (including durable, out-of-band approval), and a SHA-256 or HMAC hash-chained audit with `verify()`. About 50 microseconds per tool call.
+  </Card>
+  <Card title="Integrations" icon="puzzle-piece">
+    `infy.integrations` wraps smolagents, LangChain, and OpenHands agents with the same governance, without changing them.
+  </Card>
+</CardGroup>
+
+## Structured output
+
+`with_structured_output` accepts either a JSON-schema dict (parsed by the Rust `JsonParser`, no validation) or a pydantic model (pydantic-core fused parse and validate). The return type follows the input.
+
+```python
+from pydantic import BaseModel
+
+class Person(BaseModel):
+    name: str
+    age: int
+
+# with_structured_output returns a runnable, so call it with .invoke like any chain
+model.with_structured_output(Person).invoke("Maria Chen is 42.")
+# Person(name='Maria Chen', age=42)
+```
+
+## Governance you can prove
+
+Giving an agent real authority raises one question: how do you make that safe, and prove what it did? infy answers with an optional control plane wired into the agent loop. Omit it and nothing changes and nothing is imported. Opt in and every tool call is policy-checked in-process, and every step is written to a tamper-evident audit trail.
+
+```python
+from infy import create_agent
+from infy.governance import Governance, Policy, CallbackApprover
+
+gov = Governance(
+    policy=Policy(
+        deny=["delete_database"],        # never, regardless of approval
+        require_approval=["deploy"],     # allowed only with a human yes
+    ),
+    approver=CallbackApprover(prompt_via_slack),   # your callback: (request) -> bool
+    principal="agent://acme/assistant",
+)
+
+# search, deploy, and delete_database are your own @tool functions
+agent = create_agent(model, tools=[search, deploy, delete_database], governance=gov)
+agent("ship the release")
+
+assert gov.audit.verify()      # tamper-evident receipt of everything that happened
+```
+
+<Info>
+  Governance is deny-by-default and fail-closed. Any error in policy, risk, or approval yields a deny, and is still audited. There is no path to a silent allow. Enforcement is in-process by design, so it adds microseconds, not a network hop.
+</Info>
+
+## Honest performance
+
+Framework overhead is isolated by porting real LangChain and LangGraph projects to infy over a shared, deterministic, offline leaf, and verifying byte-identical output before any number is trusted. Only the orchestration differs, so the difference is the framework.
+
+| Dimension | infy vs LangChain / LangGraph |
+| --- | --- |
+| Cold start (import + compile) | 8.6x faster |
+| Resident memory | 5.4x lighter |
+| Per-invocation framework overhead | 21x lower |
+| Orchestration LOC | parity |
+
+<Warning>
+  Per-invocation multiples are real, but they amortize into network latency once a live model call dominates the request, so end-to-end wall clock is at parity (measured at 1.05x to 1.14x on a live, billed run). What survives to production is cold start and memory footprint, paid on every request and per running agent. That is exactly why infy targets serverless, edge, and high-density multi-tenant deployments.
+</Warning>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install infy, wire up a provider, and run your first agent.
+  </Card>
+  <Card title="Governance overview" icon="shield-check" href="/governance/overview">
+    Policy, risk tiering, human approval, durable approval, and the tamper-evident audit.
+  </Card>
+  <Card title="Integrations" icon="puzzle-piece" href="/integrations/overview">
+    Add deny-by-default policy and a verifiable audit to smolagents, LangChain, and OpenHands agents.
+  </Card>
+</CardGroup>

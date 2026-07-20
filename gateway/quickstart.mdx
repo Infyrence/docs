@@ -1,0 +1,201 @@
+---
+title: "Quickstart"
+description: "Make your first request in under a minute."
+---
+
+Make your first request to the Infyrence Gateway in three steps. The gateway is OpenAI-compatible, so you can use the official OpenAI SDKs (or plain HTTP) by pointing the base URL at `https://api.infyrence.com/v1`.
+
+<Steps>
+  <Step title="Create an API key">
+    Sign in and open [API keys](https://www.infyrence.com/dashboard/api-keys) in your dashboard. Create a key and copy it. It starts with `sk-`.
+
+    <Warning>
+      Your API key is a secret. Store it in an environment variable, never commit it to source control, and never expose it in client-side code.
+    </Warning>
+
+    Keep it handy as an environment variable:
+
+    ```bash
+    export INFYRENCE_API_KEY="sk-..."
+    ```
+  </Step>
+
+  <Step title="Point the base URL at Infyrence">
+    Every request goes to the base URL `https://api.infyrence.com/v1` and authenticates with your key as a Bearer token:
+
+    ```text
+    Authorization: Bearer sk-...
+    ```
+
+    If you already use an OpenAI SDK, set the base URL and the API key. No other code change is required.
+
+    <Note>
+      The `model` field accepts any id returned by `GET /v1/models`. Example ids include `claude-sonnet-5`, `gpt-5.5`, and `gemini-3.1-pro`. Always call [`GET /v1/models`](/gateway/models) for the live list available to your account.
+    </Note>
+  </Step>
+
+  <Step title="Make a chat completion">
+    Send a `POST` to `/v1/chat/completions` with a `model` and a list of `messages`.
+
+    <CodeGroup>
+    ```bash curl
+    curl https://api.infyrence.com/v1/chat/completions \
+      -H "Authorization: Bearer $INFYRENCE_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "model": "claude-sonnet-5",
+        "messages": [
+          { "role": "system", "content": "You are a helpful assistant." },
+          { "role": "user", "content": "Explain quantum entanglement in one sentence." }
+        ]
+      }'
+    ```
+
+    ```python python
+    from openai import OpenAI
+
+    client = OpenAI(
+        base_url="https://api.infyrence.com/v1",
+        api_key="sk-...",  # or os.environ["INFYRENCE_API_KEY"]
+    )
+
+    completion = client.chat.completions.create(
+        model="claude-sonnet-5",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Explain quantum entanglement in one sentence."},
+        ],
+    )
+
+    print(completion.choices[0].message.content)
+    ```
+
+    ```javascript javascript
+    import OpenAI from "openai";
+
+    const client = new OpenAI({
+      baseURL: "https://api.infyrence.com/v1",
+      apiKey: process.env.INFYRENCE_API_KEY, // "sk-..."
+    });
+
+    const completion = await client.chat.completions.create({
+      model: "claude-sonnet-5",
+      messages: [
+        { role: "system", content: "You are a helpful assistant." },
+        { role: "user", content: "Explain quantum entanglement in one sentence." },
+      ],
+    });
+
+    console.log(completion.choices[0].message.content);
+    ```
+    </CodeGroup>
+  </Step>
+</Steps>
+
+## The response
+
+A non-streaming request returns a single `chat.completion` JSON object. The generated text is in `choices[0].message.content`, and token counts are in `usage`.
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1710000000,
+  "model": "claude-sonnet-5",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Quantum entanglement is when two particles share a single quantum state, so measuring one instantly determines the other, no matter the distance between them."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 24,
+    "completion_tokens": 31,
+    "total_tokens": 55
+  }
+}
+```
+
+<Info>
+  Every response includes an `X-Request-Id` header. Include it when you contact support so a request can be traced quickly.
+</Info>
+
+## Stream the response
+
+Set `stream: true` to receive the response incrementally as Server-Sent Events. Each event is a `data:` line carrying a `chat.completion.chunk` object, and the stream ends with a final `data: [DONE]` line. The text for each chunk arrives in `choices[0].delta.content`.
+
+<CodeGroup>
+```bash curl
+curl https://api.infyrence.com/v1/chat/completions \
+  -H "Authorization: Bearer $INFYRENCE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.5",
+    "messages": [
+      { "role": "user", "content": "Write a haiku about the edge." }
+    ],
+    "stream": true
+  }'
+```
+
+```python python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.infyrence.com/v1",
+    api_key="sk-...",
+)
+
+stream = client.chat.completions.create(
+    model="gpt-5.5",
+    messages=[{"role": "user", "content": "Write a haiku about the edge."}],
+    stream=True,
+)
+
+for chunk in stream:
+    delta = chunk.choices[0].delta.content
+    if delta:
+        print(delta, end="", flush=True)
+```
+
+```javascript javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "https://api.infyrence.com/v1",
+  apiKey: process.env.INFYRENCE_API_KEY,
+});
+
+const stream = await client.chat.completions.create({
+  model: "gpt-5.5",
+  messages: [{ role: "user", content: "Write a haiku about the edge." }],
+  stream: true,
+});
+
+for await (const chunk of stream) {
+  const delta = chunk.choices[0]?.delta?.content;
+  if (delta) process.stdout.write(delta);
+}
+```
+</CodeGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Browse models" icon="layer-group" href="/gateway/models">
+    Call `GET /v1/models` to see every model available to your account.
+  </Card>
+  <Card title="Chat completions reference" icon="code" href="/api-reference/create-chat-completion">
+    Full request and response fields, plus every parameter you can send.
+  </Card>
+  <Card title="Authentication" icon="key" href="/gateway/authentication">
+    How Bearer tokens work and how to rotate your keys.
+  </Card>
+  <Card title="Pricing" icon="tag" href="https://www.infyrence.com/pricing">
+    Usage-based, per-model rates for input and output tokens.
+  </Card>
+</CardGroup>

@@ -1,0 +1,165 @@
+---
+title: "Authentication"
+description: "Authenticate with your Infyrence API key."
+---
+
+Every request to the Infyrence Gateway is authenticated with an API key. You send the key as an HTTP Bearer token in the `Authorization` header. The gateway is OpenAI-compatible, so the OpenAI SDKs send this header for you once you set your key.
+
+## Get your API key
+
+Create and manage keys in the dashboard. Your key looks like `sk-` followed by a long string.
+
+<Steps>
+  <Step title="Open the dashboard">
+    Go to [API keys](https://www.infyrence.com/dashboard/api-keys) in your Infyrence dashboard.
+  </Step>
+  <Step title="Create a key">
+    Create a new key and give it a name so you can identify it later.
+  </Step>
+  <Step title="Copy the key">
+    Copy the full `sk-...` value and store it somewhere safe.
+  </Step>
+</Steps>
+
+<Warning>
+  The full key value is shown only once, at creation. Infyrence stores only a hash of your key and cannot show it to you again. If you lose it, create a new key and update your app.
+</Warning>
+
+## Send the key
+
+Set the `Authorization` header to `Bearer` followed by your key.
+
+```text
+Authorization: Bearer sk-...
+```
+
+Point an OpenAI SDK at the Infyrence base URL and pass your key as the `api_key` (Python) or `apiKey` (JavaScript). No other code change is needed.
+
+<CodeGroup>
+```bash curl
+curl https://api.infyrence.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-5",
+    "messages": [{ "role": "user", "content": "Hello" }]
+  }'
+```
+
+```python python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.infyrence.com/v1",
+    api_key="sk-...",
+)
+
+resp = client.chat.completions.create(
+    model="claude-sonnet-5",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(resp.choices[0].message.content)
+```
+
+```javascript javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "https://api.infyrence.com/v1",
+  apiKey: "sk-...",
+});
+
+const resp = await client.chat.completions.create({
+  model: "claude-sonnet-5",
+  messages: [{ role: "user", content: "Hello" }],
+});
+console.log(resp.choices[0].message.content);
+```
+</CodeGroup>
+
+<Info>
+  Every model and inference endpoint under `https://api.infyrence.com/v1` requires this header, including `GET /v1/models`. The public status endpoint `GET /v1/health/providers` is the only exception.
+</Info>
+
+## Keep your key secret
+
+An API key grants access to your account balance and usage. Treat it like a password.
+
+<Note>
+  Use your key only from server-side code. Do not embed it in browsers, mobile apps, or any client that ships to end users, and do not commit it to source control. Load it from an environment variable or a secrets manager instead.
+</Note>
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.infyrence.com/v1",
+    api_key=os.environ["INFYRENCE_API_KEY"],
+)
+```
+
+If a key is exposed, revoke it in the [dashboard](https://www.infyrence.com/dashboard/api-keys) and create a new one. A revoked key stops working, and any request that presents it receives a `401`.
+
+## Authentication errors
+
+If the `Authorization` header is missing, malformed, or presents a key that is unknown, revoked, or expired, the gateway responds with `401` and an error body of type `authentication_error`.
+
+```json
+{
+  "error": {
+    "message": "Invalid API key.",
+    "type": "authentication_error",
+    "code": "invalid_api_key",
+    "request_id": "4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1"
+  }
+}
+```
+
+<ResponseField name="error.message" type="string">
+  A human-readable description of the problem.
+</ResponseField>
+
+<ResponseField name="error.type" type="string">
+  The category of error. For authentication failures this is `authentication_error`.
+</ResponseField>
+
+<ResponseField name="error.code" type="string | null">
+  A stable, machine-readable code when available, for example `invalid_api_key`.
+</ResponseField>
+
+<ResponseField name="error.request_id" type="string">
+  The id of the failed request. It also appears in the `X-Request-Id` response header. Include it when contacting support.
+</ResponseField>
+
+Common causes of a `401`:
+
+<AccordionGroup>
+  <Accordion title="Missing or malformed header">
+    The `Authorization` header is absent or does not start with `Bearer `. Send `Authorization: Bearer sk-...`.
+  </Accordion>
+  <Accordion title="Invalid key">
+    The key does not match any key on your account. Confirm you copied the full `sk-...` value with no extra whitespace.
+  </Accordion>
+  <Accordion title="Revoked key">
+    The key was revoked in the dashboard. Create a new key and update your app.
+  </Accordion>
+  <Accordion title="Expired key">
+    The key passed its expiration date. Create a new key.
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+  A `401` means the request was not authenticated. A different status, `402`, means the request was authenticated but your account has no remaining platform balance. See [Errors](/gateway/errors) for the full list.
+</Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="List models" icon="list" href="/gateway/models">
+    Call `GET /v1/models` for the live list of available models.
+  </Card>
+  <Card title="Create a chat completion" icon="message" href="/api-reference/create-chat-completion">
+    Send your first authenticated request.
+  </Card>
+</CardGroup>

@@ -1,0 +1,292 @@
+---
+title: "Errors"
+description: "The error format and how to handle each case."
+---
+
+When a request fails, the gateway returns a non-`2xx` HTTP status and a JSON body with a single `error` object. The shape is stable across every endpoint, so you can write one handler that covers all cases.
+
+## Error object
+
+Every error response has this shape:
+
+```json
+{
+  "error": {
+    "message": "Invalid API key.",
+    "type": "authentication_error",
+    "code": "invalid_api_key",
+    "request_id": "4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1"
+  }
+}
+```
+
+<ResponseField name="error.message" type="string">
+  A human-readable description of what went wrong. Safe to log, but do not branch on the exact text: match on `type` and `code` instead.
+</ResponseField>
+
+<ResponseField name="error.type" type="string">
+  The category of error. One of `invalid_request_error`, `authentication_error`, `insufficient_credits`, `not_found`, `rate_limit_error`, or `upstream_error`. This is the primary field to switch on.
+</ResponseField>
+
+<ResponseField name="error.code" type="string | null">
+  A stable, machine-readable code when one is available, otherwise `null`. Examples: `invalid_api_key`, `model_not_found`, `rate_limited`, `upstream_unavailable`.
+</ResponseField>
+
+<ResponseField name="error.request_id" type="string">
+  The id of the failed request. Include it when you contact support so the request can be traced. This matches the `X-Request-Id` response header.
+</ResponseField>
+
+<Note>
+  The gateway never leaks upstream provider details. For provider or infrastructure failures, `message` is generic and the underlying detail is kept in the server-side logs keyed by `request_id`.
+</Note>
+
+## Request id header
+
+Every response, success or error, carries an `X-Request-Id` header with a unique id for that request. On error responses the same value also appears as `error.request_id`.
+
+```text
+X-Request-Id: 4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1
+```
+
+<Tip>
+  Log `X-Request-Id` for every call, not just failures. It is the fastest way for support to locate a specific request.
+</Tip>
+
+## Status codes
+
+Each HTTP status maps to a single error `type`.
+
+| Status | `type` | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_request_error` | The request was malformed or failed validation (for example, a missing `messages` field). |
+| `401` | `authentication_error` | The API key is missing or invalid. |
+| `402` | `insufficient_credits` | No remaining balance for platform models. Add funds, or use your own provider key (BYOK). |
+| `404` | `not_found` | The requested model or resource does not exist. |
+| `429` | `rate_limit_error` | Too many requests. Retry after the `Retry-After` interval. |
+| `503` | `upstream_error` | The model is temporarily unavailable. Retry after a short delay. |
+
+### 400 invalid_request_error
+
+The request body did not validate. The `message` points at the offending field, and `code` is usually `null`.
+
+```json
+{
+  "error": {
+    "message": "messages: Required",
+    "type": "invalid_request_error",
+    "code": null,
+    "request_id": "4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1"
+  }
+}
+```
+
+Fix the request before retrying. Retrying an identical body will fail the same way.
+
+### 401 authentication_error
+
+The `Authorization` header is missing, or the key is not valid. The `code` is `invalid_api_key`.
+
+```json
+{
+  "error": {
+    "message": "Invalid API key.",
+    "type": "authentication_error",
+    "code": "invalid_api_key",
+    "request_id": "4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1"
+  }
+}
+```
+
+Confirm you are sending `Authorization: Bearer sk-...` and that the key is active in the [dashboard](https://www.infyrence.com/dashboard/api-keys).
+
+### 402 insufficient_credits
+
+Your account has no remaining balance for platform models. The `code` is `null`.
+
+```json
+{
+  "error": {
+    "message": "Insufficient balance. Add funds, or use your own provider key (BYOK) to continue.",
+    "type": "insufficient_credits",
+    "code": null,
+    "request_id": "4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1"
+  }
+}
+```
+
+Add funds on the [pricing](https://www.infyrence.com/pricing) and billing pages, or configure a bring-your-own-key (BYOK) provider key to bill the provider directly.
+
+### 404 not_found
+
+The requested model or resource does not exist. The `code` is `model_not_found` for an unknown model id.
+
+```json
+{
+  "error": {
+    "message": "The requested model was not found.",
+    "type": "not_found",
+    "code": "model_not_found",
+    "request_id": "4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1"
+  }
+}
+```
+
+Call `GET /v1/models` for the live list of ids. See [Models](/gateway/models).
+
+### 429 rate_limit_error
+
+You have sent too many requests. The `code` is `rate_limited`.
+
+```json
+{
+  "error": {
+    "message": "Rate limit exceeded. Please slow down.",
+    "type": "rate_limit_error",
+    "code": "rate_limited",
+    "request_id": "4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1"
+  }
+}
+```
+
+A `429` response includes rate-limit headers. Wait for the `Retry-After` interval before retrying.
+
+<ResponseField name="Retry-After" type="integer">
+  Seconds to wait before retrying.
+</ResponseField>
+
+<ResponseField name="X-RateLimit-Limit" type="integer">
+  Your request limit for the current window.
+</ResponseField>
+
+<ResponseField name="X-RateLimit-Remaining" type="integer">
+  Requests remaining in the current window.
+</ResponseField>
+
+<ResponseField name="X-RateLimit-Reset" type="integer">
+  When the current window resets.
+</ResponseField>
+
+### 503 upstream_error
+
+The model is temporarily unavailable, typically a transient provider or infrastructure failure. The `code` is `upstream_unavailable`, and the `message` is intentionally generic.
+
+```json
+{
+  "error": {
+    "message": "The model is temporarily unavailable. Please try again in a few moments.",
+    "type": "upstream_error",
+    "code": "upstream_unavailable",
+    "request_id": "4f0c2e1a-9b3d-4a2e-8c1f-77a0b2d5e6f1"
+  }
+}
+```
+
+Retry after a short delay with exponential backoff.
+
+## Handling errors
+
+Retry `429` and `503`, which are transient. Do not retry `400`, `401`, `402`, or `404` without changing the request, the key, the balance, or the model.
+
+<CodeGroup>
+
+```python python
+import time
+from openai import OpenAI, APIStatusError
+
+client = OpenAI(
+    base_url="https://api.infyrence.com/v1",
+    api_key="sk-...",
+)
+
+RETRYABLE = {429, 503}
+
+def create_with_retry(**kwargs):
+    for attempt in range(5):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except APIStatusError as e:
+            body = e.response.json().get("error", {})
+            request_id = body.get("request_id")
+            if e.status_code in RETRYABLE and attempt < 4:
+                # Honor Retry-After on 429, otherwise back off.
+                wait = float(e.response.headers.get("retry-after", 2 ** attempt))
+                time.sleep(wait)
+                continue
+            print(f"failed: {body.get('type')} (request_id={request_id})")
+            raise
+
+resp = create_with_retry(
+    model="claude-sonnet-5",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(resp.choices[0].message.content)
+```
+
+```javascript javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "https://api.infyrence.com/v1",
+  apiKey: "sk-...",
+});
+
+const RETRYABLE = new Set([429, 503]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function createWithRetry(params) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return await client.chat.completions.create(params);
+    } catch (e) {
+      const body = e.error ?? {};
+      if (RETRYABLE.has(e.status) && attempt < 4) {
+        const retryAfter = Number(e.headers?.["retry-after"]) || 2 ** attempt;
+        await sleep(retryAfter * 1000);
+        continue;
+      }
+      console.error(`failed: ${body.type} (request_id=${body.request_id})`);
+      throw e;
+    }
+  }
+}
+
+const resp = await createWithRetry({
+  model: "claude-sonnet-5",
+  messages: [{ role: "user", content: "Hello" }],
+});
+console.log(resp.choices[0].message.content);
+```
+
+```bash curl
+# Inspect the status line, X-Request-Id header, and error body together.
+curl -sS -i https://api.infyrence.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-5",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+</CodeGroup>
+
+<Warning>
+  Do not retry `400`, `401`, `402`, or `404` responses unchanged. They will keep failing until you fix the request, key, balance, or model id.
+</Warning>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Chat completions" icon="message" href="/api-reference/create-chat-completion">
+    The request and response fields for the main endpoint.
+  </Card>
+  <Card title="Models" icon="cubes" href="/gateway/models">
+    List live model ids with `GET /v1/models`.
+  </Card>
+  <Card title="Authentication" icon="key" href="/gateway/authentication">
+    Send your API key as a Bearer token.
+  </Card>
+  <Card title="Rate limits" icon="gauge-high" href="/gateway/rate-limits">
+    Understand the `429` headers and backoff.
+  </Card>
+</CardGroup>
