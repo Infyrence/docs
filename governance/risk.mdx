@@ -1,0 +1,131 @@
+---
+title: "Risk tiering"
+description: "Score every action, escalate the risky ones."
+---
+
+Policy decides *who* may act. Risk decides *how much scrutiny* the action needs. The `RiskEngine` assigns every tool call one of four tiers, and `escalate_at` turns that tier into a gate: any permitted action at or above the threshold is routed to a human approver before it runs.
+
+## The four tiers
+
+`RiskTier` is a string enum defined in `infy/governance/types.py`. The tiers are ordered by severity.
+
+| Tier | Value | Meaning |
+| --- | --- | --- |
+| `LOW` | `"low"` | Reads and other pure or side-effect-free calls. |
+| `MEDIUM` | `"medium"` | Outbound network and external API calls. |
+| `HIGH` | `"high"` | Writes, database and filesystem mutations, code execution, sensitive data. |
+| `CRITICAL` | `"critical"` | Financial actions. |
+
+Severity ordering is exposed through `tier_at_least(tier, threshold)`, which returns `True` when `tier` is at or above `threshold`. The engine and the escalation gate both rely on this ranking.
+
+## How a tier is assigned
+
+`RiskEngine.assess(tool, args)` resolves a tier from the tool's static metadata. It checks three sources in order and returns the first that applies.
+
+<Steps>
+  <Step title="Explicit risk_tier wins">
+    If the tool declares `risk_tier`, that value is used verbatim: `RiskTier(tool.risk_tier)`. This is the override. A tool author who knows the risk states it directly.
+  </Step>
+  <Step title="Verb mapping">
+    Otherwise, if the tool declares a `verb` and that verb is known, the engine maps it to a tier (see the table below). The lookup is case-insensitive: `tool.verb.upper()` is matched.
+  </Step>
+  <Step title="Side-effect default">
+    If neither is set, the engine falls back to the tool's `side_effect` flag. A side-effecting tool becomes `HIGH`. A pure or read-only tool becomes `LOW`.
+  </Step>
+</Steps>
+
+The relevant `Tool` fields (from `infy/tools.py`) are all optional governance metadata: `risk_tier`, `verb`, and `side_effect`. If none are set on a tool, `side_effect` defaults to `False`, so an unannotated tool assesses as `LOW`.
+
+<Warning>
+The conservative default only kicks in when a tool is marked side-effecting but left unprofiled. An **unprofiled side-effecting tool** (`side_effect=True`, no `risk_tier`, no known `verb`) is treated as `HIGH`. That is deliberate: an action with unknown blast radius should not slip through as low risk.
+</Warning>
+
+## The verb table
+
+When a tool sets `verb` but not `risk_tier`, the engine uses this fixed mapping from `infy/governance/risk.py`.
+
+| Verb | Tier |
+| --- | --- |
+| `READ` | `LOW` |
+| `API_GET` | `LOW` |
+| `NETWORK` | `MEDIUM` |
+| `EXTERNAL_API` | `MEDIUM` |
+| `WRITE` | `HIGH` |
+| `DB` | `HIGH` |
+| `FS` | `HIGH` |
+| `EXECUTE` | `HIGH` |
+| `SENSITIVE_DATA` | `HIGH` |
+| `FINANCIAL` | `CRITICAL` |
+
+A verb outside this table is ignored, and resolution falls through to the `side_effect` default.
+
+## Profiling a tool
+
+Attach the metadata when you define the tool. Any of the three inputs works. Pick the most specific one you can.
+
+```python
+from infy.tools import tool
+
+# Explicit tier: you know exactly how risky this is.
+@tool(risk_tier="critical", verb="DB", side_effect=True)
+def transfer_funds(account: str, amount: float) -> str:
+    ...
+
+# Verb only: let the table decide (EXECUTE -> HIGH).
+@tool(verb="EXECUTE", side_effect=True)
+def run_shell(command: str) -> str:
+    ...
+
+# Side-effect only: unprofiled and mutating -> HIGH by default.
+@tool(side_effect=True)
+def delete_record(record_id: str) -> str:
+    ...
+
+# Nothing set: pure read -> LOW.
+@tool()
+def lookup(key: str) -> str:
+    ...
+```
+
+<Note>
+When `risk_tier` and `verb` disagree, `risk_tier` wins because it is checked first. In `transfer_funds` above, the explicit `"critical"` is used, not the `DB` verb's `HIGH`.
+</Note>
+
+## Risk gates the decision
+
+Assessing a tier is only half the story. On its own, the tier is an annotation on the audit record. `escalate_at`, set on the `Governance` object, is what makes risk *gate* the run.
+
+Inside `Governance._authorize`, the flow is:
+
+1. `tier = self.risk.assess(tool, args)` scores the call.
+2. The policy engine evaluates the request. A `FORBID` blocks it outright.
+3. For a permitted request, approval is required when the policy attached a `REQUIRE_APPROVAL` obligation **or** when `escalate_at is not None and tier_at_least(tier, self.escalate_at)`.
+
+```python
+needs_approval = Obligation.REQUIRE_APPROVAL in decision.obligations or (
+    self.escalate_at is not None and tier_at_least(tier, self.escalate_at)
+)
+```
+
+`escalate_at` defaults to `RiskTier.HIGH`. So out of the box, every `HIGH` and `CRITICAL` action is sent to the approver, and the default approver is `DenyAll`. The practical effect: an unprofiled, side-effecting tool assesses as `HIGH`, hits the gate, and is denied by default unless a human approves it.
+
+<Tip>
+Set `escalate_at=None` to disable risk-based escalation entirely. Policy-driven `REQUIRE_APPROVAL` obligations still apply, so you keep explicit approvals while dropping the blanket tier gate.
+</Tip>
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Policy" icon="shield-halved" href="/governance/policy">
+    Deny-by-default authorization that runs before risk is scored.
+  </Card>
+  <Card title="Approval" icon="user-check" href="/governance/approval">
+    Human-in-the-loop review, including durable approval that suspends a run.
+  </Card>
+  <Card title="Audit" icon="file-lines" href="/governance/audit">
+    The tamper-evident, hash-chained record where each tier lands.
+  </Card>
+  <Card title="Governance overview" icon="scale-balanced" href="/governance/overview">
+    How policy, risk, approval, and audit compose on the agent loop.
+  </Card>
+</CardGroup>

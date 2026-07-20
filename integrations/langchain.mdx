@@ -1,0 +1,138 @@
+---
+title: "LangChain"
+description: "Govern a LangChain agent."
+---
+
+LangChain runs a tool through `BaseTool.invoke`. `infy.integrations.langchain.govern` wraps each of your tools at that chokepoint so every call first asks infy governance whether the action is allowed. A denied or unapproved action never runs. The model receives the block reason as the tool output instead, and every decision is written to the tamper-evident audit chain.
+
+The wrapped tools are `StructuredTool` instances with the same name, description, and args schema, so they are drop-in replacements. Pass them to `create_react_agent`, `AgentExecutor`, or `bind_tools` exactly as you pass your originals. Your agent code does not change.
+
+<Note>
+This adapter only needs `langchain-core`. Install it with `pip install langchain-core`.
+</Note>
+
+## How it works
+
+`govern` returns one governed tool per input tool. When the agent invokes a governed tool:
+
+<Steps>
+  <Step title="Check the policy and risk">
+    The wrapper calls `governance.before_tool` with the tool's metadata (name, verb, risk tier, side effect) and the call arguments.
+  </Step>
+  <Step title="Block or run">
+    If the decision is not allowed, the wrapper returns `[Infyrence governance] <message>` as the tool result and the underlying tool never runs. If allowed, it calls the real `tool.invoke`.
+  </Step>
+  <Step title="Record the outcome">
+    On an allowed call, `governance.after_tool` records the result. Every decision, allowed or denied, lands in the audit chain.
+  </Step>
+</Steps>
+
+## The risk map
+
+The `risk` argument maps a tool name to its risk profile: `verb`, `risk_tier`, and `side_effect`. The risk engine reads these to tier each call.
+
+```python
+tools = govern(
+    [read_config, delete_database, deploy],
+    gov,
+    risk={
+        "read_config": {"verb": "READ", "risk_tier": "low", "side_effect": False},
+        "delete_database": {"verb": "DB", "risk_tier": "critical", "side_effect": True},
+        "deploy": {"verb": "EXECUTE", "risk_tier": "high", "side_effect": True},
+    },
+)
+```
+
+<Warning>
+A tool not named in `risk` is treated as conservatively high-risk and side-effecting (`{"verb": "EXECUTE", "risk_tier": "high", "side_effect": True}`). Governance fails safe on an unprofiled tool rather than waving it through. Override this fallback with the `default` argument.
+</Warning>
+
+## Full example
+
+This wires three real LangChain tools through governance and drives them the way an agent would. Reads run, the destructive delete is denied by policy and never executes, and the high-risk deploy pauses for a human before it is allowed.
+
+```python
+from langchain_core.tools import tool
+
+from infy.governance import AuditLog, CallbackApprover, Governance, Policy
+from infy.integrations.langchain import govern
+
+
+@tool
+def read_config(path: str) -> str:
+    """Read a configuration file."""
+    return "region=prod, replicas=3"
+
+
+@tool
+def delete_database(name: str) -> str:
+    """Delete a database. Destructive and irreversible."""
+    return f"DELETED {name}"
+
+
+@tool
+def deploy(target: str) -> str:
+    """Deploy a build to an environment."""
+    return f"deployed {target}"
+
+
+def approve(request) -> bool:
+    return True  # a real approver asks a human
+
+
+audit = AuditLog()
+gov = Governance(
+    policy=Policy(
+        allow=["read_config", "deploy"],  # deny-by-default: delete_database is not allowlisted
+        deny=["delete_database"],
+        require_approval=["deploy"],
+    ),
+    approver=CallbackApprover(approve),
+    audit=audit,
+    principal="agent://langchain/sre",
+    escalate_at=None,
+)
+
+tools = {
+    t.name: t
+    for t in govern(
+        [read_config, delete_database, deploy],
+        gov,
+        risk={
+            "read_config": {"verb": "READ", "risk_tier": "low", "side_effect": False},
+            "delete_database": {"verb": "DB", "risk_tier": "critical", "side_effect": True},
+            "deploy": {"verb": "EXECUTE", "risk_tier": "high", "side_effect": True},
+        },
+    )
+}
+
+# What a LangChain agent would decide to call, step by step.
+plan = [
+    ("read_config", {"path": "prod.yaml"}),
+    ("delete_database", {"name": "orders_prod"}),  # destructive, must be denied
+    ("deploy", {"target": "checkout-hotfix"}),  # high-risk, needs a human
+]
+
+for name, args in plan:
+    result = tools[name].invoke(args)
+    print(f"{name}: {result}")
+
+print(f"Audit chain verify(): {audit.verify()}")
+```
+
+Because the agent calls `tool.invoke` just like this loop does, pointing a real LLM at these same governed tools behaves identically. The `delete_database` call returns a governance block message and never executes, while the allowed and denied decisions are all recorded in the hash-chained audit that `audit.verify()` confirms was not altered.
+
+<Tip>
+The runnable version of this example lives at `examples/langchain_governance_demo.py`. Run it with `python examples/langchain_governance_demo.py`.
+</Tip>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Governance overview" icon="shield" href="/governance/overview">
+    Policy, risk tiering, approval, and the audit chain.
+  </Card>
+  <Card title="Durable approval" icon="clock" href="/governance/durable-approval">
+    Suspend a run for a human and resume it later, TOCTOU-safe.
+  </Card>
+</CardGroup>

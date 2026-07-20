@@ -1,0 +1,128 @@
+---
+title: "Installation"
+description: "Install infy and its optional provider extras."
+---
+
+infy is a zero-dependency Python framework. The core installs on a bare interpreter with no third-party runtime dependencies. Provider SDKs, pydantic, and the compiled Rust core are all optional extras you add only when you need them.
+
+## Requirements
+
+- Python 3.10, 3.11, 3.12, or 3.13.
+- `pip`. No system libraries are required for the core.
+
+<Note>
+infy ships a compiled Rust extension (`infy_core`) that accelerates the hot paths (JSON parsing, similarity, tokenization). Every module that uses it falls back to a pure-Python implementation when the extension is absent, so the framework is fully functional either way.
+</Note>
+
+## Install the core
+
+```bash
+pip install infy
+```
+
+This installs the pure-Python framework and the Rust extension when a wheel is available for your platform, with a pure-Python fallback otherwise. The core covers the `ChatModel` protocol, runnables, structured output, `create_agent`, the `StateGraph` runtime, and the governance layer.
+
+## Add provider extras
+
+Each model provider ships its SDK as an optional extra. Install only the ones you use.
+
+<CodeGroup>
+```bash OpenAI
+pip install "infy[openai]"
+```
+
+```bash Anthropic
+pip install "infy[anthropic]"
+```
+
+```bash Gemini
+pip install "infy[gemini]"
+```
+
+```bash Ollama
+pip install "infy[ollama]"
+```
+
+```bash Structured output
+pip install "infy[pydantic]"
+```
+
+```bash All providers
+pip install "infy[all]"
+```
+</CodeGroup>
+
+The extras map to these packages:
+
+| Extra | Installs | Enables |
+| --- | --- | --- |
+| `openai` | `openai>=1.0.0` | `infy.providers.openai.OpenAIChat` |
+| `anthropic` | `anthropic>=0.30.0` | `infy.providers.anthropic.AnthropicChat` |
+| `gemini` | `google-genai>=1.0.0` | `infy.providers.gemini.GeminiChat` (AI Studio and Vertex) |
+| `ollama` | `ollama>=0.3.0` | `infy.providers.ollama.OllamaChat` |
+| `pydantic` | `pydantic>=2.0.0` | validated structured output via `with_structured_output` |
+| `all` | `openai`, `anthropic`, `google-genai`, `ollama` | every provider |
+
+<Tip>
+Combine extras in one install, for example `pip install "infy[openai,pydantic]"`. Quote the specifier so your shell does not interpret the brackets.
+</Tip>
+
+<Note>
+The `all` extra installs the four provider SDKs. It does not include `pydantic`. Add `pydantic` explicitly when you want validated structured output: `pip install "infy[all,pydantic]"`.
+</Note>
+
+## Install from source (alpha)
+
+<Warning>
+infy is in alpha. Until the first tagged PyPI release, install from source.
+</Warning>
+
+The core includes a Rust extension, so a source install builds it with `maturin`. A release build is required for the full test suite and for accurate performance.
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/Infyrence/infy.git
+    cd infy
+    ```
+  </Step>
+  <Step title="Install with dev dependencies">
+    ```bash
+    pip install -e ".[dev]"
+    ```
+    The `dev` extra adds `pytest`, `pytest-asyncio`, `ruff`, `mypy`, and `pydantic`.
+  </Step>
+  <Step title="Build the Rust core">
+    ```bash
+    maturin develop --release
+    ```
+    Build in release mode. Debug builds fail the performance checks.
+  </Step>
+</Steps>
+
+## Verify the install
+
+```python
+from infy import create_agent, tool, HumanMessage
+
+print("infy imported successfully")
+```
+
+If your Rust toolchain was unavailable during a source install, imports still succeed on the pure-Python fallback. The compiled `infy_core` extension only changes performance, not behavior.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Send your first message and stream a response.
+  </Card>
+  <Card title="Providers" icon="plug" href="/providers">
+    Configure OpenAI, Anthropic, Gemini, and Ollama.
+  </Card>
+  <Card title="Agents" icon="robot" href="/concepts/agents">
+    Build a tool-calling agent with `create_agent`.
+  </Card>
+  <Card title="Governance" icon="shield" href="/governance/overview">
+    Policy-check tool calls and write a tamper-evident audit.
+  </Card>
+</CardGroup>

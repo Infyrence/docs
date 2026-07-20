@@ -1,0 +1,100 @@
+---
+title: "Govern any agent"
+description: "Wrap third-party agents with infy governance."
+---
+
+infy governance is not only for infy agents. `infy.integrations` wraps the tool or action chokepoint of frameworks you already use, so you can add deny-by-default policy, human approval, and a tamper-evident audit to agents you already run, without changing them.
+
+## The pattern
+
+Every governed framework follows the same shape. You build a `Governance` object once, then pass your existing tools through a `govern` adapter. The adapter returns drop-in replacements that route each execution through governance first.
+
+```python
+from smolagents import ToolCallingAgent
+from infy.governance import Governance, Policy, CallbackApprover
+from infy.integrations.smolagents import govern
+
+gov = Governance(
+    policy=Policy(
+        allow=["read_file", "run_shell"],
+        deny=["delete_all"],
+        require_approval=["run_shell"],
+    ),
+    approver=CallbackApprover(ask_a_human),
+)
+
+# Same tools, now governed. The agent is unchanged.
+agent = ToolCallingAgent(tools=govern(my_tools, gov), model=model)
+```
+
+A denied or unapproved action never runs. The model receives the block reason as the tool output and adapts. Every decision, allowed or denied, lands in the same SHA-256 or HMAC hash-chained audit you can `verify()`.
+
+<Note>
+The core stays zero-dependency. Each adapter lazily imports its framework, so nothing is pulled in until you import the adapter you need (for example `infy.integrations.smolagents`).
+</Note>
+
+## How `govern` works
+
+`govern` takes your list of tools and the `Governance` object, plus an optional `risk` map, and returns wrapped tools.
+
+```python
+tools = govern(
+    [read_file, run_shell, delete_all],
+    gov,
+    risk={
+        "run_shell":  {"verb": "EXECUTE", "risk_tier": "high",     "side_effect": True},
+        "delete_all": {"verb": "EXECUTE", "risk_tier": "critical", "side_effect": True},
+        "read_file":  {"verb": "READ",    "risk_tier": "low",      "side_effect": False},
+    },
+)
+```
+
+<Steps>
+  <Step title="You pass tools plus a risk profile">
+    `risk` maps a tool name to `{"verb": ..., "risk_tier": ..., "side_effect": ...}`. This is the static metadata infy's risk engine reads to decide whether a call is high enough risk to need a human.
+  </Step>
+  <Step title="Unprofiled tools fail safe">
+    Any tool not named in `risk` gets the `default` profile, which is conservatively high-risk and side-effecting (`verb: "EXECUTE"`, `risk_tier: "high"`, `side_effect: True`). An unprofiled tool is escalated to a human approver rather than waved through.
+  </Step>
+  <Step title="Execution passes through the chokepoint">
+    Each wrapped tool calls `governance.before_tool(...)` first. If the decision is not allowed, the original tool never runs and the block reason is returned to the model. If it is allowed, the tool runs and `governance.after_tool(...)` records the result.
+  </Step>
+</Steps>
+
+You can also override the fallback profile with the `default` argument:
+
+```python
+tools = govern(my_tools, gov, default={"verb": "EXECUTE", "risk_tier": "critical", "side_effect": True})
+```
+
+<Warning>
+An unprofiled side-effecting tool is treated as HIGH risk on purpose. If your default approver is `DenyAll`, an unprofiled tool is denied. Profile every tool you intend to allow, or set an approver that can grant a human yes.
+</Warning>
+
+## What you get
+
+The same governance guarantees that apply to native infy agents apply to wrapped ones:
+
+- **Deny-by-default, fail-closed.** Any error in policy, risk, or approval yields a deny, and is still audited. There is no path to a silent allow.
+- **Human approval gate.** A pluggable `Approver` pauses high-risk calls for a human yes or no, recorded in the audit chain.
+- **Tamper-evident audit.** Every decision is appended to a hash-chained log you can `verify()`.
+
+The wrapper adds about 50 microseconds per tool call, so it is cheap enough to leave on.
+
+## Choose your framework
+
+<CardGroup cols={2}>
+  <Card title="smolagents" icon="robot" href="/integrations/smolagents">
+    Wrap `smolagents` tools with `infy.integrations.smolagents.govern`. Governance gates each tool at `Tool.forward`.
+  </Card>
+  <Card title="LangChain" icon="link" href="/integrations/langchain">
+    Wrap LangChain tools with `infy.integrations.langchain.govern`, the same pattern at the LangChain tool boundary.
+  </Card>
+  <Card title="OpenHands" icon="shield" href="/integrations/openhands">
+    Plug infy governance into OpenHands through `infy.integrations.openhands.build_analyzer`, an adapter for its `SecurityAnalyzer` hook.
+  </Card>
+</CardGroup>
+
+<Info>
+Runnable demos, including a real smolagents agent that has a destructive action denied and a deploy paused for a human, are in the repository `examples/` directory.
+</Info>

@@ -1,0 +1,98 @@
+---
+title: "Governance overview"
+description: "An in-process control plane for agent actions."
+---
+
+Giving an agent real authority (shell, deploys, money, customer data) raises one question: how do you make that safe, and prove what it did? infy answers it with an optional control plane wired directly into the agent loop. Omit it and nothing changes and nothing is imported. Opt in and every tool call is policy-checked in-process, and every step is written to a tamper-evident audit trail.
+
+## Why governance
+
+Most agent frameworks stop at capability: they let a model call tools. The hard part starts once those tools can do something irreversible. Two needs appear at once:
+
+- Control before the fact: some actions must never run, and some must run only with a human yes.
+- Evidence after the fact: you need to prove, cryptographically, exactly what the agent did and what was allowed or denied.
+
+infy governance is the layer that provides both. It is the differentiated part of the framework, not a bolt-on.
+
+## Opt in with `create_agent`
+
+Governance is entirely opt-in. You attach a `Governance` object through the `governance` argument of `create_agent`. When you omit it, the agent loop is byte-for-byte unchanged, and nothing in `infy` core imports the governance module.
+
+```python
+from infy import create_agent
+from infy.governance import Governance, Policy, CallbackApprover
+
+gov = Governance(
+    policy=Policy(
+        deny=["delete_database"],        # never, regardless of approval
+        require_approval=["deploy"],     # allowed only with a human yes
+    ),
+    approver=CallbackApprover(my_slack_prompt),   # how a human decides
+    principal="agent://acme/assistant",
+)
+
+agent = create_agent(model, tools=[search, deploy, delete_database], governance=gov)
+agent("ship the release")
+
+for event in gov.audit.events:    # the receipt
+    ...
+assert gov.audit.verify()         # tamper-evident
+```
+
+<Note>
+When `governance` is omitted the loop is unchanged and the module is never imported. You pay nothing, in weight or behavior, until you opt in.
+</Note>
+
+## The four properties
+
+A `Governance` object bundles a policy engine, a risk engine, an approver, and an audit log, and exposes the hook points the agent loop calls. Together they give you four properties.
+
+<Steps>
+  <Step title="Deny-by-default policy">
+    The `PythonPolicyEngine` evaluates every request with Cedar-style semantics: deny-by-default, forbid-overrides-permit, and fail-closed. The `Policy` surface (`allow`, `deny`, `require_approval`, `approve_when`) compiles down to those rules. An action that no rule permits does not run.
+  </Step>
+  <Step title="Risk tiering">
+    The `RiskEngine` assigns a tier to each call from the tool's static profile. An unprofiled side-effecting tool is treated as HIGH. Risk gates the decision through `escalate_at` (default `RiskTier.HIGH`): any permitted action at or above that tier is sent to the approver rather than auto-running. Set `escalate_at` to `None` to disable that gate.
+  </Step>
+  <Step title="Human approval">
+    A pluggable `Approver` decides high-risk calls. The default is `DenyAll`, so the fail-closed posture holds even before you wire in a human. `CallbackApprover` routes the decision to your own prompt (Slack, a web UI). Approval can also be durable: a run suspends, persists, and resumes minutes or hours later once a human decides, with each approval cryptographically bound to the exact action (TOCTOU-safe).
+  </Step>
+  <Step title="Tamper-evident audit">
+    The `AuditLog` is append-only and SHA-256 hash-chained, with an optional HMAC key held outside the agent so the chain is not purely self-anchored. Call `gov.audit.verify()` to confirm the chain is intact. This is the evidence trail SOC 2 and the EU AI Act expect.
+  </Step>
+</Steps>
+
+## In-process by design
+
+Enforcement runs in-process, at the existing tool and model chokepoints, as a plain function call. A policy-decision microservice with a network hop before every tool call would erase infy's reason to exist (cold start, memory density, latency), so the decision never leaves the process. Only the heavy parts (audit persistence, approval queues) touch I/O, and only off the hot path.
+
+The critical boundary is `before_tool`. For each call it runs: assess risk tier, evaluate policy, and if approval is required, call the approver, then reach a final allow or deny and write exactly one audit event. A denied call returns a `ToolMessage` with an error status that the loop already knows how to handle, so the run stays recoverable.
+
+<Warning>
+The enforcement path is fail-closed end to end. Any error in risk scoring, policy evaluation, or the approver yields a deny, and the denial is still audited. There is no path where a governance error silently lets an action through.
+</Warning>
+
+## The cost
+
+Governance is cheap enough to leave on for every agent. The isolated policy, risk, and audit decision measures about 20 to 35 microseconds. End-to-end in a real agent loop it adds about 50 microseconds per tool call, roughly 0.003% of the 1 to 2 second LLM call it guards.
+
+<Info>
+You can reproduce the figure with `python examples/governance_demo.py`. Full methodology is in `BENCHMARKS.md`.
+</Info>
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Policy and risk" icon="shield-halved" href="/governance/policy">
+    Write deny-by-default rules and understand how the risk engine tiers each call.
+  </Card>
+  <Card title="Human approval" icon="user-check" href="/governance/approval">
+    Wire in an `Approver`, from inline callbacks to durable, out-of-band sign-off.
+  </Card>
+  <Card title="Tamper-evident audit" icon="file-shield" href="/governance/audit">
+    Read the hash-chained log, add an HMAC key, and verify the chain.
+  </Card>
+  <Card title="Govern any agent" icon="plug" href="/integrations/overview">
+    Wrap smolagents, LangChain, and OpenHands agents with the same governance.
+  </Card>
+</CardGroup>

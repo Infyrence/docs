@@ -1,0 +1,164 @@
+---
+title: "Human approval"
+description: "Pause high-risk actions for a human yes or no."
+---
+
+Some actions are too consequential to run on the model's say-so. An approver is the human in the loop: when a policy or risk tier escalates a tool call, the approver decides yes or no before the tool runs.
+
+Approval sits inside the tool chokepoint. It never touches the model or your business logic, and it adds nothing to calls that are not escalated.
+
+## Where approval fits
+
+The `before_tool` hook on `Governance` runs on every tool call. It scores risk, evaluates policy, and only then consults the approver. A call reaches the approver when either condition holds:
+
+- The policy attaches a `REQUIRE_APPROVAL` obligation to its decision.
+- The call's risk tier is at or above `escalate_at` (default `RiskTier.HIGH`).
+
+If neither holds, the call is allowed and the approver is never invoked. Everything the approver sees has already survived policy: a `FORBID` decision is denied outright and never reaches approval.
+
+```python
+from infy.governance import Governance
+from infy.governance.approval import CallbackApprover
+
+gov = Governance(
+    policy=policy,
+    approver=CallbackApprover(lambda req: input(f"Approve {req.tool}? [y/N] ") == "y"),
+    escalate_at=RiskTier.HIGH,  # gate anything HIGH or above
+)
+```
+
+<Note>
+`escalate_at` makes risk *gate* the decision, not just annotate it. Any permitted action at or above that tier is sent to the approver, so an unprofiled high-risk or side-effecting tool is denied by default unless a human approves. Set `escalate_at=None` to disable risk-driven escalation and rely on policy obligations alone.
+</Note>
+
+## The `Approver` protocol
+
+An approver is any object with a single method. `Approver` is a `runtime_checkable` `Protocol`, so you do not need to subclass anything: match the shape and it works.
+
+```python
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Approver(Protocol):
+    def review(self, request: ApprovalRequest) -> bool: ...
+```
+
+`review` returns `True` to allow the call and `False` to reject it. It must answer immediately. If a human sign-off cannot happen inline, use a `DurableApprover` instead, which suspends the run rather than blocking a thread. See [Durable approval](/governance/durable-approval).
+
+## `ApprovalRequest`
+
+`review` receives one argument, a frozen `ApprovalRequest`, describing the exact action awaiting a decision.
+
+```python
+@dataclass(frozen=True)
+class ApprovalRequest:
+    tool: str            # the tool's name
+    args: dict[str, Any] # the arguments it was called with
+    risk_tier: str       # the assessed tier, e.g. "high"
+    reason: str          # why approval was required
+```
+
+For risk or policy escalation, `reason` is `"policy/risk requires approval"`. Use these fields to render a prompt, post to a review channel, or key an audit record.
+
+## Built-in approvers
+
+<CardGroup cols={2}>
+  <Card title="DenyAll" icon="ban">
+    Rejects everything. The fail-closed default.
+  </Card>
+  <Card title="CallbackApprover" icon="user-check">
+    Delegates the decision to a callable you supply.
+  </Card>
+  <Card title="AutoApprove" icon="triangle-exclamation">
+    Approves everything. Development and testing only.
+  </Card>
+  <Card title="DurableApprover" icon="clock" href="/governance/durable-approval">
+    Suspends the run for out-of-band, hours-later sign-off.
+  </Card>
+</CardGroup>
+
+### `DenyAll` (the default)
+
+`Governance` defaults its `approver` field to `DenyAll`. If you configure escalation but never wire an approver, every escalated call is rejected. This is deliberate: an unattended agent cannot approve its own high-risk actions.
+
+```python
+class DenyAll:
+    """Reject everything. The fail-closed default when no approver is configured."""
+
+    def review(self, request: ApprovalRequest) -> bool:
+        return False
+```
+
+<Warning>
+Fail-closed is the whole point. If you see escalated calls being blocked with "Approval rejected", check whether you left the approver at its `DenyAll` default.
+</Warning>
+
+### `CallbackApprover`
+
+Wrap any `Callable[[ApprovalRequest], bool]`: a console prompt, a Slack round-trip, a queue consumer. The return value is coerced with `bool`.
+
+```python
+from infy.governance.approval import CallbackApprover, ApprovalRequest
+
+def review(req: ApprovalRequest) -> bool:
+    print(f"{req.tool} ({req.risk_tier}): {req.args}")
+    return input("approve? [y/N] ").strip().lower() == "y"
+
+approver = CallbackApprover(review)
+```
+
+Your callback must return promptly, since it runs inline on the tool call. A callback that itself waits on a human for minutes will hold the run's thread the whole time; reach for [durable approval](/governance/durable-approval) there.
+
+### `AutoApprove`
+
+Approves every request. Convenient for tests and local development where you want the escalation path exercised without a prompt.
+
+```python
+class AutoApprove:
+    """Approve everything. Development and testing only, never production."""
+
+    def review(self, request: ApprovalRequest) -> bool:
+        return True
+```
+
+<Warning>
+Never ship `AutoApprove` to production. It disables the human gate entirely, turning every escalation into an automatic yes.
+</Warning>
+
+## How a decision is handled
+
+Inside `before_tool`, the approver's verdict is recorded and enforced:
+
+<Steps>
+  <Step title="Approver is consulted">
+    `approver.review(ApprovalRequest(...))` is called only when the call needs approval.
+  </Step>
+  <Step title="Errors are treated as rejection">
+    If `review` raises, the call is audited as `rejected` and blocked with `"Approval failed for <tool>"`. An approver that fails does not fail open.
+  </Step>
+  <Step title="Verdict is audited">
+    The decision (`approved` or `rejected`) is written to the tamper-evident audit log along with the tool, tier, and reasons.
+  </Step>
+  <Step title="Rejection blocks the tool">
+    A `False` verdict returns a blocking `ToolDecision` (`"Approval rejected for <tool>"`); a `True` verdict lets the tool run.
+  </Step>
+</Steps>
+
+The one exception is `ApprovalRequired`. A `DurableApprover` raises it to signal "no decision yet, suspend the run." `before_tool` lets it propagate rather than treating it as an error, so the run can persist and resume later.
+
+<Info>
+Every approval path is audited, including rejections and approver errors. See [Audit](/governance/audit) for how those records are hash-chained and verified.
+</Info>
+
+## When inline approval is not enough
+
+`Approver.review` is synchronous: it must answer in the moment. Real human sign-off can take minutes or hours, which no thread should block on. For that, use a `DurableApprover`, which looks up a prior decision in an `ApprovalStore` and, when none exists, records the pending request and raises `ApprovalRequired` so the run suspends and resumes once a human decides.
+
+<CardGroup cols={2}>
+  <Card title="Durable approval" icon="clock" href="/governance/durable-approval">
+    Suspend a run at the approval point and resume it hours later, TOCTOU-safe.
+  </Card>
+  <Card title="Policy" icon="scale-balanced" href="/governance/policy">
+    How `REQUIRE_APPROVAL` obligations and `FORBID` decisions are produced.
+  </Card>
+</CardGroup>

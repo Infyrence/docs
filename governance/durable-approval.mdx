@@ -1,0 +1,172 @@
+---
+title: "Durable approval"
+description: "Suspend a run for a human, resume it hours later."
+---
+
+A synchronous approver has to answer immediately. A real human sign-off can take minutes or hours, and no thread can wait that long. Durable approval lets a governed run **suspend** at the approval point, persist itself, and **resume** later once a human has decided, without blocking anything.
+
+<Info>
+Durable approval lives in `infy.governance`, not the core agent loop. The default [`create_agent`](/concepts/agents) stays synchronous and untouched. This is the opt-in durable path.
+</Info>
+
+## How it works
+
+The pieces fit together around a single `run_id`:
+
+<Steps>
+  <Step title="A run reaches a gated tool">
+    `DurableApprover.review()` looks for a prior human decision in an `ApprovalStore`. If none exists, it records the pending request and raises `ApprovalRequired`.
+  </Step>
+  <Step title="The run suspends and persists">
+    `DurableAgent` catches `ApprovalRequired`, saves the run's messages to the store keyed by `run_id`, and returns an `AgentResult` with `status="suspended"`.
+  </Step>
+  <Step title="A human decides, later">
+    You surface the pending approval to an inbox. Hours later, a human approves or denies it.
+  </Step>
+  <Step title="The run resumes">
+    `agent.resume(run_id, decisions)` records the verdicts, reloads the persisted messages, and continues from exactly where it suspended.
+  </Step>
+</Steps>
+
+## Run, suspend, resume
+
+The suspend and resume boundary is a plain function call return. Between `run` and `resume`, your process can restart, and the run waits in the store.
+
+```python
+from infy.governance import (
+    DurableAgent,
+    DurableApprover,
+    Governance,
+    InMemoryApprovalStore,
+    Policy,
+)
+
+store = InMemoryApprovalStore()
+gov = Governance(
+    policy=Policy(allow=["read_ledger", "pay"], require_approval=["pay"]),
+    approver=DurableApprover(store),
+)
+agent = DurableAgent(model, [read_ledger, pay], governance=gov, store=store)
+
+# Start the run.
+result = agent.run("pay the invoice", run_id="run-1")
+
+if result.status == "suspended":
+    pending = result.pending_approvals[0]
+    print(pending.request.tool)        # "pay"
+    print(pending.request.args)        # {"amount": 100, "to": "acme"}
+    fp = pending.fingerprint           # what a human is deciding
+
+    # ... hours later, in a different process, a human said yes ...
+    result = agent.resume("run-1", {fp: True})
+
+print(result.status)                   # "completed"
+```
+
+<Note>
+`DurableAgent` takes the same arguments as `create_agent` (`model`, `tools`, `system_prompt`, `max_iterations`) plus a required `governance` and `store`. Its `governance` must use a `DurableApprover`, and both must share the same `store`.
+</Note>
+
+## The suspended `AgentResult`
+
+`run()` and `resume()` both return an `AgentResult`. Durable approval adds three fields that describe a suspended run.
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `"completed"` or `"suspended"`. |
+| `pending_approvals` | List of `PendingApproval`, each with a `request` and a `fingerprint`. Empty when completed. |
+| `run_id` | The id you passed to `run()`, echoed back for correlation. |
+
+A `PendingApproval` carries the `ApprovalRequest` (its `tool`, `args`, `risk_tier`, and `reason`) so you can render exactly what a human is being asked to authorize, and the `fingerprint` you key the decision by.
+
+## The fingerprint binds an approval to the exact action
+
+A verdict is not "approve the run". It is "approve this tool with these arguments". The `fingerprint` function computes a stable SHA-256 over the tool name and canonicalized arguments:
+
+```python
+from infy.governance import fingerprint
+
+fingerprint("pay", {"amount": 100}) == fingerprint("pay", {"amount": 100})   # True
+fingerprint("pay", {"amount": 100}) != fingerprint("pay", {"amount": 200})   # different args
+fingerprint("pay", {"amount": 100}) != fingerprint("wire", {"amount": 100})  # different tool
+fingerprint("pay", {"a": 1, "b": 2}) == fingerprint("pay", {"b": 2, "a": 1}) # arg order ignored
+```
+
+A recorded decision only applies to a call with the **same** fingerprint. When you call `resume`, each verdict is bound to the exact `(tool, args)` it was granted for.
+
+<Warning>
+This defeats a TOCTOU (time-of-check to time-of-use) swap. If the arguments change between when a human approves and when the action runs, the recorded verdict no longer matches, so the run stays suspended and the action does not execute. A verdict recorded against a different fingerprint never releases the action.
+</Warning>
+
+## Fail-closed guarantee
+
+An action that is never approved never runs. There is no default that lets a gated call through.
+
+- When a gated tool has no recorded decision, the run suspends. The side effect does not run, and no tool result is produced.
+- In a batch that mixes a safe read with a gated payment, **every** call in the batch is decided before **any** call executes. A pending approval suspends the whole batch, so the read does not run ahead of the payment's approval.
+- A denial resumes the run with a blocked tool result the model can see, and the denied action still never executes.
+- A `DurableApprover` used outside a `DurableAgent` run (with no run scope bound) raises `RuntimeError` rather than silently approving.
+
+```python
+# Deny the payment.
+result = agent.resume("run-1", {fp: False})
+# The payment never ran; the model saw an error tool result and continued.
+```
+
+## The `ApprovalStore`
+
+`ApprovalStore` is a `Protocol`. It holds three things per `run_id`: recorded decisions, pending requests, and the suspended run's messages.
+
+```python
+class ApprovalStore(Protocol):
+    def get_decision(self, run_id: str, fingerprint: str) -> bool | None: ...
+    def put_decision(self, run_id: str, fingerprint: str, approved: bool) -> None: ...
+    def record_pending(self, run_id: str, pending: PendingApproval) -> None: ...
+    def save_state(self, run_id: str, messages: list[Message]) -> None: ...
+    def load_state(self, run_id: str) -> list[Message] | None: ...
+    def clear(self, run_id: str) -> None: ...
+```
+
+`InMemoryApprovalStore` ships for development and tests. It is not durable across processes, so implement the protocol against a real backend (for example Postgres) for production.
+
+<Note>
+When a run completes, `DurableAgent` calls `store.clear(run_id)`, which drops the persisted state and pending records. `InMemoryApprovalStore` keeps recorded decisions as a small record of what was decided.
+</Note>
+
+## Resuming an unknown run
+
+`resume` raises `KeyError` if there is no suspended run for the `run_id`, for example because it already completed and its state was cleared.
+
+```python
+agent.resume("never-suspended", {})   # raises KeyError
+```
+
+## Multi-step runs
+
+A single run can gate more than one action. If a resumed run reaches a second gated tool, it suspends again with a new `PendingApproval`. Keep resuming until `status` is `"completed"`.
+
+```python
+s1 = agent.run("two payments", run_id="run-1")   # suspended on payment 1
+d1 = agent.resume("run-1", {s1.pending_approvals[0].fingerprint: True})
+
+# d1.status == "suspended": a second gated action appeared
+d2 = agent.resume("run-1", {d1.pending_approvals[0].fingerprint: True})
+# d2.status == "completed"
+```
+
+Every approve and deny is written to the [audit chain](/governance/audit), so `audit.verify()` still holds across a suspend and resume.
+
+<CardGroup cols={2}>
+  <Card title="Governance overview" icon="shield" href="/governance/overview">
+    Policy, risk tiering, approval, and audit on the agent loop.
+  </Card>
+  <Card title="Human approval" icon="user-check" href="/governance/approval">
+    The synchronous approvers: `CallbackApprover`, `AutoApprove`, `DenyAll`.
+  </Card>
+  <Card title="Audit chain" icon="link" href="/governance/audit">
+    The tamper-evident hash chain with `verify()`.
+  </Card>
+  <Card title="Policy" icon="scale-balanced" href="/governance/policy">
+    Deny-by-default allowlists and approval requirements.
+  </Card>
+</CardGroup>

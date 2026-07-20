@@ -1,0 +1,185 @@
+---
+title: "smolagents"
+description: "Govern a smolagents agent."
+---
+
+Wrap a smolagents agent's tools with infy governance and gain deny-by-default policy, risk tiering, human approval, and a tamper-evident audit trail. The agent's code does not change. The governed tools are drop-in replacements for the originals.
+
+## How it works
+
+smolagents runs a tool through `Tool.__call__`, which calls `Tool.forward`. The adapter in `infy.integrations.smolagents` wraps each tool in a `GovernedTool` whose `forward` first asks governance whether the action is allowed.
+
+<Steps>
+  <Step title="Governance runs before the tool">
+    `GovernedTool.forward` calls `governance.before_tool(...)` with the tool's metadata and the call arguments.
+  </Step>
+  <Step title="Denied actions never execute">
+    If the decision is not allowed, the inner tool is never called. The model receives the block reason as the tool result and must adapt.
+  </Step>
+  <Step title="Allowed actions run, then are recorded">
+    If allowed, the inner tool runs and `governance.after_tool(...)` records the result.
+  </Step>
+  <Step title="Every decision is audited">
+    Allowed or denied, each decision is written to the tamper-evident audit chain that `verify()` confirms.
+  </Step>
+</Steps>
+
+## The `govern` function
+
+`govern` takes your list of smolagents tools, a `Governance` instance, and a risk map. It returns a new list of governed tools.
+
+```python
+from infy.integrations.smolagents import govern
+
+tools = govern(
+    [read_file, run_shell, delete_all],
+    gov,
+    risk={
+        "run_shell": {"verb": "EXECUTE", "risk_tier": "high", "side_effect": True},
+        "delete_all": {"verb": "EXECUTE", "risk_tier": "critical", "side_effect": True},
+        "read_file": {"verb": "READ", "risk_tier": "low", "side_effect": False},
+    },
+)
+```
+
+### Parameters
+
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `tools` | `list` | The smolagents tools to wrap. |
+| `governance` | `Governance` | The governance instance that decides each call. |
+| `risk` | `dict` | Optional. Maps a tool name to its `verb`, `risk_tier`, and `side_effect`. |
+| `default` | `dict` | Optional. Risk profile for any tool not named in `risk`. |
+
+### The risk map
+
+Each entry maps a tool name to a small dict:
+
+- `verb`: the action category, for example `READ`, `EXECUTE`, or `DB`.
+- `risk_tier`: `low`, `medium`, `high`, or `critical`.
+- `side_effect`: whether the tool changes state.
+
+<Warning>
+  Any tool not listed in `risk` gets the default profile, which is `{"verb": "EXECUTE", "risk_tier": "high", "side_effect": True}`. This is conservative on purpose: an unprofiled tool is treated as a high-risk, side-effecting action, so governance fails safe rather than waving it through. Override it with the `default` parameter if you need different behavior.
+</Warning>
+
+## Full example with a `ToolCallingAgent`
+
+This mirrors `examples/smolagents_governance_demo.py`. Reads run, the destructive action is denied by policy and never executes, and the high-risk deploy pauses for a human before it is allowed.
+
+```python
+from smolagents import ToolCallingAgent, tool
+from smolagents.models import Model
+
+from infy.governance import AuditLog, CallbackApprover, Governance, Policy
+from infy.integrations.smolagents import govern
+
+
+@tool
+def read_config(path: str) -> str:
+    """Read a configuration file.
+
+    Args:
+        path: the config file path
+    """
+    return "region=prod, replicas=3"
+
+
+@tool
+def delete_database(name: str) -> str:
+    """Delete a database. Destructive and irreversible.
+
+    Args:
+        name: the database to delete
+    """
+    return f"DELETED {name}"
+
+
+@tool
+def deploy(target: str) -> str:
+    """Deploy a build to an environment.
+
+    Args:
+        target: the deploy target
+    """
+    return f"deployed {target}"
+
+
+def approve(request) -> bool:
+    print(f"  [human] approval requested for '{request.tool}' -> approving")
+    return True
+
+
+audit = AuditLog()
+gov = Governance(
+    policy=Policy(
+        allow=["read_config", "deploy"],  # deny-by-default: delete_database is not allowlisted
+        deny=["delete_database"],
+        require_approval=["deploy"],
+    ),
+    approver=CallbackApprover(approve),
+    audit=audit,
+    principal="agent://smolagents/sre",
+    escalate_at=None,
+)
+
+tools = govern(
+    [read_config, delete_database, deploy],
+    gov,
+    risk={
+        "read_config": {"verb": "READ", "risk_tier": "low", "side_effect": False},
+        "delete_database": {"verb": "DB", "risk_tier": "critical", "side_effect": True},
+        "deploy": {"verb": "EXECUTE", "risk_tier": "high", "side_effect": True},
+    },
+)
+
+agent = ToolCallingAgent(tools=tools, model=model, max_steps=6)
+agent.run("Investigate the incident and remediate it.")
+
+print(f"Audit chain verify(): {audit.verify()}")
+```
+
+<Note>
+  The governed tools are drop-in replacements, so point any real model at them (`OpenAIServerModel`, `LiteLLMModel`, and so on) and the agent behaves identically. The demo file uses a scripted model so it runs deterministically without an API key.
+</Note>
+
+## What a denied action returns
+
+When governance blocks a call, the inner tool never runs. `GovernedTool.forward` returns a string to the agent's model:
+
+```text
+[Infyrence governance] <decision message>
+```
+
+The model sees this as the tool output and must adapt its next step. It does not execute the blocked action.
+
+## Reading the audit trail
+
+Every decision, allowed or denied, lands in the `AuditLog`. Iterate its events and confirm the chain was not altered with `verify()`.
+
+```python
+for e in audit.events:
+    if e.action == "invoke_tool":
+        reason = ", ".join(e.reasons)
+        print(f"{e.decision.upper():<9} {e.resource:<16} risk={e.risk_tier:<8} ({reason})")
+
+print(f"verify(): {audit.verify()}")
+```
+
+## Try it
+
+Run the full demo, which needs only smolagents installed:
+
+```bash
+pip install smolagents
+python examples/smolagents_governance_demo.py
+```
+
+<CardGroup cols={2}>
+  <Card title="Governance overview" icon="shield-halved" href="/governance/overview">
+    Policy, risk tiering, approval, and the audit chain in depth.
+  </Card>
+  <Card title="Human approval" icon="user-check" href="/governance/approval">
+    How `require_approval` and approvers gate high-risk actions.
+  </Card>
+</CardGroup>

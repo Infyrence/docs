@@ -1,0 +1,153 @@
+---
+title: "Composition"
+description: "Compose runnables with the pipe operator."
+---
+
+A runnable is any unit of computation that takes an input and returns an output. Models, parsers, tools, and plain functions are all runnables. You compose them with the `|` operator into a pipeline, and run that pipeline sync or async with one call.
+
+## The runnable contract
+
+Every runnable implements the same small protocol, defined in `infy/core.py`. That is the entire contract:
+
+```python
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Runnable(Protocol[T]):
+    def invoke(self, input, ctx=None): ...
+    async def ainvoke(self, input, ctx=None): ...
+    def stream(self, input, ctx=None): ...
+    def astream(self, input, ctx=None): ...
+    def __or__(self, other): ...
+    def __ror__(self, other): ...
+```
+
+Because it is a `Protocol`, anything with these methods is a runnable. There is no base class to inherit from.
+
+<Note>
+Every method takes an optional `ctx` (a `Context`). Leave it out and the runnable uses defaults. See [Context](#context-and-concurrency) below.
+</Note>
+
+## Piping into a Sequence
+
+The `|` operator chains runnables left to right into a `Sequence`. Each step receives the previous step's output.
+
+```python
+from infy import HumanMessage, JsonParser, Lambda
+from infy.providers.openai import OpenAIChat
+
+model = OpenAIChat("gpt-4o")
+
+chain = Lambda(lambda topic: [HumanMessage(content=f"Return JSON facts about {topic}.")]) | model | JsonParser()
+```
+
+`Sequence` runs its steps in order, threading the result through:
+
+```python
+chain.invoke("the Pregel model")          # sync
+```
+
+```python
+await chain.ainvoke("the Pregel model")   # async
+```
+
+`ainvoke` awaits each step in turn, so an async chain never blocks the event loop. `Sequence` also flattens: piping two sequences together produces one flat `Sequence`, not a nested one.
+
+## Automatic coercion
+
+You rarely construct runnables by hand. When you pipe something that is not already a runnable, `coerce` (in `infy/core.py`) converts it:
+
+| You pipe | You get |
+| --- | --- |
+| a `Runnable` | itself, unchanged |
+| a plain callable | a `Lambda` |
+| a `dict` | a `Parallel` |
+| a `Tool` | an internal tool adapter |
+
+So a bare function drops straight into a chain:
+
+```python
+chain = model | (lambda reply: reply.text.upper())
+```
+
+The function is wrapped in a `Lambda` automatically. Piping a callable that `coerce` cannot handle raises `TypeError`.
+
+### Lambda
+
+`Lambda` wraps a synchronous function as a runnable. Its `invoke` calls the function directly; its `ainvoke` runs the function in an executor so a sync function does not block the loop.
+
+```python
+from infy import Lambda
+
+extract = Lambda(lambda reply: reply.text.strip())
+```
+
+For a coroutine function, use `AsyncLambda`, whose `ainvoke` awaits the function directly. The async coercion helper `acoerce` picks `AsyncLambda` automatically for coroutine functions.
+
+<Tip>
+Use `Lambda` for pure sync work and `AsyncLambda` when your function is `async def`. Both compose with `|` exactly like any other runnable.
+</Tip>
+
+## Parallel: fan out on one input
+
+A `dict` in a chain becomes a `Parallel`. Each value is coerced to a runnable, every branch receives the same input, and the result is a `dict` with the same keys.
+
+```python
+from infy import HumanMessage, Lambda, Parallel
+
+fan_out = Parallel({
+    "summary": Lambda(lambda t: [HumanMessage(content=f"Summarize {t}.")]) | model,
+    "keywords": Lambda(lambda t: [HumanMessage(content=f"List keywords for {t}.")]) | model,
+})
+
+fan_out.invoke("bulk-synchronous parallelism")
+# {"summary": ..., "keywords": ...}
+```
+
+You can write the same thing as a plain `dict` and let coercion build the `Parallel` for you:
+
+```python
+chain = Lambda(prepare) | {"a": branch_a, "b": branch_b}
+```
+
+Branches run concurrently. `invoke` runs them across a `ThreadPoolExecutor`; `ainvoke` runs them under `asyncio.gather`. Both honor `max_concurrency` from the `Context` when set.
+
+<Warning>
+`Parallel` returns a `dict` keyed by branch name. The next step in a chain receives that whole `dict`, so a downstream runnable must expect a `dict` input.
+</Warning>
+
+## Context and concurrency
+
+Every runnable method accepts an optional `Context`. It carries `tags`, `metadata`, and `max_concurrency`, and passes down through a chain.
+
+```python
+from infy import Context, Parallel
+
+ctx = Context(max_concurrency=2, tags=["batch"])
+fan_out.invoke("some topic", ctx)
+```
+
+For `Parallel`, `max_concurrency` caps how many branches run at once (a semaphore under `ainvoke`, the thread-pool size under `invoke`). Leave `ctx` as `None` and each `Parallel` defaults to running all of its branches at once.
+
+## Streaming through a chain
+
+Runnables also expose `stream` and `astream`. A `Sequence` streams by piping each step's output into the next, yielding chunks as they arrive.
+
+```python
+for chunk in chain.stream("the Pregel model"):
+    print(chunk)
+```
+
+```python
+async for chunk in chain.astream("the Pregel model"):
+    print(chunk)
+```
+
+<CardGroup cols={2}>
+<Card title="Chat models" icon="robot" href="/concepts/models">
+The `ChatModel` protocol every provider implements, and how it plugs into a chain.
+</Card>
+<Card title="Structured output" icon="brackets-curly" href="/concepts/structured-output">
+Parse and validate model output with `JsonParser` or a pydantic model.
+</Card>
+</CardGroup>

@@ -1,47 +1,173 @@
 ---
 title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+description: "From zero to a governed agent in a few minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+Get from a first model call to a fully governed agent in a few minutes. This page walks three steps: call a model, give it a tool, then put that same agent behind a policy that denies destructive actions, requires human approval for risky ones, and writes a receipt you can verify.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Info>
+  infy's core has no third-party runtime dependencies. Governance is optional: omit it and nothing is imported, opt in and every tool call is policy-checked in-process (about 50 microseconds per call).
+</Info>
 
-## Prerequisites
+## Install
 
-Before you begin, you must have:
+Install the core plus one provider extra. The examples below use OpenAI.
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+<CodeGroup>
+```bash OpenAI
+pip install "infy[openai]"
+```
 
-## Get started
+```bash Anthropic
+pip install "infy[anthropic]"
+```
+
+```bash All providers
+pip install "infy[all]"
+```
+</CodeGroup>
+
+Requires Python 3.10 or newer. Set your provider key in the environment (`OPENAI_API_KEY` for the OpenAI examples).
+
+<Note>
+  During alpha, install from source until the first tagged PyPI release. See `CONTRIBUTING.md` for `pip install -e ".[dev]"` and `maturin develop --release`.
+</Note>
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Call a model">
+    A `ChatModel` takes a list of messages and returns an `AIMessage`. Read the reply text off `.text`.
 
-    ```bash
-    npm install your-package
+    ```python
+    from infy import HumanMessage
+    from infy.providers.openai import OpenAIChat
+
+    model = OpenAIChat("gpt-4o")
+
+    reply = model.generate([
+        HumanMessage(content="Summarize bulk-synchronous parallelism in one sentence."),
+    ])
+    print(reply.text)
+    ```
+
+    Every provider implements the same protocol, so `agenerate`, `stream`, and `astream` are available on the same object, and providers are interchangeable in chains, agents, and graphs.
+
+    ```python
+    async for chunk in model.astream([
+        HumanMessage(content="Stream me a haiku about schedulers."),
+    ]):
+        print(chunk.content, end="", flush=True)
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
-    ```bash
-    your-cli init
+  <Step title="Give it a tool">
+    Wrap a plain function with `@tool`, then pass it to `create_agent`. The docstring becomes the tool description and the type hints become its schema.
+
+    ```python
+    from infy import create_agent, tool
+
+    @tool
+    def get_weather(city: str) -> str:
+        """Return the current weather for a city."""
+        return f"{city}: 17C, clear"
+
+    agent = create_agent(model, tools=[get_weather])
+    result = agent("What's the weather in Boston?")
+
+    print(result.response.text)
+    print(result.iterations, result.tool_calls_made)
     ```
+
+    `create_agent` returns a callable that runs a tight loop: the model is called, any tool calls it makes are executed (in parallel by default), the results are fed back, and the loop repeats until the model stops calling tools or `max_iterations` (default `10`) is reached. The call returns an `AgentResult` with `messages`, `response`, `iterations`, and `tool_calls_made`.
+
+    <Tip>
+      For async, use `create_async_agent`, which returns a coroutine yielding the same `AgentResult`.
+    </Tip>
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
 
-    ```bash
-    your-cli start
+  <Step title="Make it safe with governance">
+    Now give the agent tools with real authority and put a control plane in front of them. Build a `Governance` object and pass it to `create_agent` with the `governance` keyword. Nothing else about the agent changes.
+
+    ```python
+    from infy import create_agent, tool
+    from infy.governance import Governance, Policy, CallbackApprover, ApprovalRequest
+
+    @tool
+    def search(query: str) -> str:
+        """Search internal docs."""
+        return "..."
+
+    @tool
+    def deploy(service: str) -> str:
+        """Deploy a service to production."""
+        return f"deployed {service}"
+
+    @tool
+    def delete_database(name: str) -> str:
+        """Permanently delete a database."""
+        return f"deleted {name}"
+
+    def ask_a_human(request: ApprovalRequest) -> bool:
+        # Wire this to Slack, a console prompt, or a queue. Returns True to allow.
+        answer = input(f"Approve {request.tool}({request.args})? [y/N] ")
+        return answer.strip().lower() == "y"
+
+    gov = Governance(
+        policy=Policy(
+            deny=["delete_database"],       # never runs, regardless of approval
+            require_approval=["deploy"],     # runs only on a human yes
+        ),
+        approver=CallbackApprover(ask_a_human),
+        principal="agent://acme/assistant",
+    )
+
+    agent = create_agent(
+        model,
+        tools=[search, deploy, delete_database],
+        governance=gov,
+    )
+    agent("ship the release")
+
+    assert gov.audit.verify()   # tamper-evident receipt of everything that happened
     ```
+
+    Three things are now true for every tool call:
+
+    - **Deny wins.** `delete_database` is on the `deny` list, so the call never executes. The agent receives the block reason as the tool result and adapts. Denials are still audited.
+    - **Approval gates the rest.** `deploy` requires a human yes. The `CallbackApprover` is handed an `ApprovalRequest` (its `tool`, `args`, `risk_tier`, and `reason`), and the call runs only if your callback returns `True`.
+    - **Everything is recorded.** `gov.audit.verify()` walks the hash-chained log and confirms it has not been tampered with.
+
+    <Warning>
+      Governance is deny-by-default and fail-closed. If policy, risk, or approval raises, the call is denied, not silently allowed, and the denial is audited. With no approver configured, high-risk calls default to `DenyAll`.
+    </Warning>
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## What just happened
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+The governed loop adds four checks at the existing model and tool chokepoints, in-process, with no network hop:
+
+| Stage | Behavior |
+| --- | --- |
+| Policy | Deny-by-default, forbid-overrides-permit. A denied tool never runs. |
+| Risk | Tools carry a risk profile. An unprofiled side-effecting tool is treated as HIGH. |
+| Approval | A pluggable `Approver` (default `DenyAll`) pauses risky calls for a human yes or no. |
+| Audit | An append-only SHA-256 or HMAC hash-chained log with `verify()`. |
+
+For sign-off that cannot happen inline, `DurableAgent` suspends a run, persists it, and resumes minutes or hours later once a human decides, with each approval cryptographically bound to the exact action (TOCTOU-safe). See the governance guide for the durable flow.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Governance overview" icon="shield-halved" href="/governance/overview">
+    Policy, risk tiering, approval gates, durable approval, and the tamper-evident audit in depth.
+  </Card>
+  <Card title="Tools and agents" icon="wrench" href="/concepts/agents">
+    The `@tool` decorator, `create_agent`, `create_async_agent`, and parallel tool execution.
+  </Card>
+  <Card title="Govern any agent" icon="plug" href="/integrations/overview">
+    Wrap smolagents, LangChain, and OpenHands agents with the same governance, unchanged.
+  </Card>
+  <Card title="The graph runtime" icon="diagram-project" href="/graph/overview">
+    `StateGraph`, reducers, checkpointing, and human-in-the-loop interrupts for branching flows.
+  </Card>
+</CardGroup>

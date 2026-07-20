@@ -1,0 +1,177 @@
+---
+title: "Policy"
+description: "Deny-by-default, fail-closed authorization."
+---
+
+The policy layer decides whether a tool call is allowed. It is the first gate every governed action passes through. The design goal is safety under uncertainty: when a rule is missing, ambiguous, or errors out, the call is denied, never allowed.
+
+The engine implements Cedar's evaluation semantics in pure Python, so it works on a zero-dependency install. Two ideas define its behavior:
+
+- **Deny-by-default.** Nothing is permitted unless a rule permits it.
+- **Forbid-overrides-permit.** A single matching `forbid` rule vetoes any number of `permit` rules.
+
+<Note>
+The `PolicyEngine` protocol is a seam. The default `PythonPolicyEngine` can be swapped for an embedded Cedar engine later without changing any call site.
+</Note>
+
+## The `Policy` object
+
+`Policy` is the ergonomic surface you write. It compiles to low-level rules and satisfies the `PolicyEngine` protocol, so you can pass it anywhere an engine is expected. It has four fields, all optional.
+
+```python
+from infy.governance.engine import Policy
+
+policy = Policy(
+    allow=["search", "read_file"],   # if set, ONLY these tools are permitted
+    deny=["delete_database"],        # always forbidden, overrides everything
+    require_approval=["send_email"], # permitted, but gated on human approval
+    approve_when=lambda req: req.risk_tier.value == "critical",  # gate on a predicate
+)
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `allow` | `Sequence[str] \| None` | If set, only these tool names are permitted. If `None`, permit all tools except those denied. |
+| `deny` | `Sequence[str] \| None` | Tool names that are always forbidden. `forbid` overrides every permit. |
+| `require_approval` | `Sequence[str] \| None` | Tool names permitted but carrying a `REQUIRE_APPROVAL` obligation. |
+| `approve_when` | `Callable[[AuthRequest], bool] \| None` | A predicate over the request. When it returns `True`, the call carries a `REQUIRE_APPROVAL` obligation. |
+
+## Allowlist vs permit-all semantics
+
+The `allow` field flips the engine between two modes.
+
+<Tabs>
+  <Tab title="Permit-all (allow is None)">
+    When `allow` is `None`, the engine emits a `permit-all` rule. Every tool is permitted unless it appears in `deny`. Use this for a permissive base where you subtract specific dangerous tools.
+
+    ```python
+    Policy(deny=["delete_database"])
+    # every tool allowed except delete_database
+    ```
+  </Tab>
+  <Tab title="Allowlist (allow is set)">
+    When `allow` is set, the engine emits a `permit` rule scoped to exactly those tool names. Any tool not on the list falls through to the default deny. Use this for a locked-down base where you enumerate what is permitted.
+
+    ```python
+    Policy(allow=["search", "read_file"])
+    # only search and read_file allowed; everything else denied
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+In allowlist mode, `require_approval` and `approve_when` can never widen the permit set. Approval only gates tools that are also allowed. A tool listed in `require_approval` but absent from `allow` stays denied, and `approve_when` is wrapped so it only matches allowlisted tools. Default-deny always wins for non-allowlisted tools.
+</Warning>
+
+## Forbid overrides permit
+
+Evaluation runs in a fixed order inside `PythonPolicyEngine.evaluate`:
+
+<Steps>
+  <Step title="Collect matching forbids">
+    If any `forbid` rule matches the request, evaluation stops and returns `FORBID`. No permit can rescue a call that a forbid matches.
+  </Step>
+  <Step title="Collect matching permits">
+    If no forbid matched, gather matching `permit` rules. If any match, return `PERMIT` and merge their obligations (deduplicated and sorted).
+  </Step>
+  <Step title="Default deny">
+    If nothing matched, return `FORBID` with reason `default-deny`.
+  </Step>
+</Steps>
+
+This is why `deny` beats `allow`. Putting a tool in both lists still forbids it.
+
+```python
+policy = Policy(allow=["send_email"], deny=["send_email"])
+# send_email is denied: the forbid rule wins
+```
+
+## Fail-closed behavior
+
+The entire evaluation body is wrapped in a `try/except`. If any rule condition raises (a buggy `approve_when` predicate, for example), the engine does not propagate the exception and does not fall through to permit. It returns a `FORBID` decision with reason `fail-closed:<ExceptionType>`.
+
+```python
+def evaluate(self, request: AuthRequest) -> Decision:
+    try:
+        ...
+    except Exception as exc:  # any evaluation error fails CLOSED, never open
+        return Decision(Effect.FORBID, reasons=(f"fail-closed:{type(exc).__name__}",))
+```
+
+<Tip>
+A crashing policy is a denied action, not an open door. This is the safest possible default for an authorization boundary.
+</Tip>
+
+## What the engine evaluates
+
+Each call is an `AuthRequest`, evaluated at a chokepoint. Its fields are available to your `approve_when` predicate and to any custom rule condition.
+
+```python
+@dataclass(frozen=True)
+class AuthRequest:
+    principal: str
+    action: str  # "invoke_tool" | "model_call"
+    tool: str
+    args: dict[str, Any]
+    risk_tier: RiskTier
+    context: dict[str, Any] = field(default_factory=dict)
+```
+
+Evaluation returns a `Decision`.
+
+```python
+@dataclass(frozen=True)
+class Decision:
+    effect: Effect                       # PERMIT or FORBID
+    obligations: tuple[Obligation, ...]  # e.g. REQUIRE_APPROVAL
+    reasons: tuple[str, ...]             # e.g. ("permit:allowlist",) or ("default-deny",)
+
+    @property
+    def permitted(self) -> bool:
+        return self.effect is Effect.PERMIT
+```
+
+The `reasons` tuple traces which named rules fired (`permit:allowlist`, `forbid:denylist`, `default-deny`, `fail-closed:KeyError`), which makes decisions auditable.
+
+<Note>
+The only shipped obligation is `Obligation.REQUIRE_APPROVAL`. Other obligations such as redaction are intentionally not shipped until they are enforced, because a declared-but-unenforced control is worse than no control.
+</Note>
+
+## The `PolicyEngine` seam
+
+`PolicyEngine` is a runtime-checkable `Protocol` with a single method.
+
+```python
+@runtime_checkable
+class PolicyEngine(Protocol):
+    def evaluate(self, request: AuthRequest) -> Decision: ...
+```
+
+Both `Policy` and `PythonPolicyEngine` satisfy it. To go beyond the four-field `Policy` surface, build rules directly. Each `Rule` has an `effect`, an optional `tools` tuple (`None` matches any tool), an optional `condition` predicate (`None` matches unconditionally), obligations, and a `name` for audit reasons.
+
+```python
+from infy.governance.engine import Rule, PythonPolicyEngine
+from infy.governance.types import Effect, Obligation
+
+engine = PythonPolicyEngine(rules=[
+    Rule(Effect.FORBID, tools=("delete_database",), name="denylist"),
+    Rule(
+        Effect.PERMIT,
+        condition=lambda req: req.risk_tier.value in ("low", "medium"),
+        name="low-risk-permit",
+    ),
+])
+```
+
+Any object with a matching `evaluate` method is a valid engine, so you can also supply your own implementation behind the same protocol.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Governance overview" icon="shield" href="/governance/overview">
+    How policy, risk, approval, and audit compose on the agent loop.
+  </Card>
+  <Card title="Approval" icon="user-check" href="/governance/approval">
+    Turning a `REQUIRE_APPROVAL` obligation into a human decision, including durable approval.
+  </Card>
+</CardGroup>

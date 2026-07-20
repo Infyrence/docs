@@ -1,0 +1,203 @@
+---
+title: "Tools and agents"
+description: "Define tools and run a ReAct agent."
+---
+
+An agent is a model that can call your functions. In infy you define those functions as tools with the `@tool` decorator, hand them to `create_agent`, and get back a callable that runs a tight ReAct loop: the model decides which tools to call, infy runs them, and the results go back to the model until it produces a final answer.
+
+## Define a tool
+
+Decorate any function with `@tool`. infy reads the function name, docstring, and type-annotated signature to build the JSON schema the model needs. No separate schema class, no manual argument validation.
+
+```python
+from infy import tool
+
+@tool
+def get_weather(city: str) -> str:
+    """Return the current weather for a city."""
+    return f"{city}: 17C, clear"
+```
+
+Here the tool `name` becomes `get_weather`, the `description` comes from the docstring, and `city` becomes a required string parameter. Parameters with defaults become optional; parameters without defaults are marked required.
+
+<Note>
+  The docstring is the tool description the model sees. Write it for the model: say what the tool does and when to use it.
+</Note>
+
+### How the schema is built
+
+infy maps Python annotations to JSON schema types automatically.
+
+| Python annotation | JSON schema type |
+| --- | --- |
+| `str` | `string` |
+| `int` | `integer` |
+| `float` | `number` |
+| `bool` | `boolean` |
+| `list` | `array` |
+| `dict` | `object` |
+
+A parameter with no default is added to the schema's `required` list. A parameter with a default is optional, and its default is recorded in the schema. A parameter with an unrecognized annotation falls back to `string`, but a parameter with no annotation at all gets no `type`. The `self` and `cls` parameters are skipped, so methods work too.
+
+At call time, `Tool.invoke` accepts either a dict or a JSON string, drops any keys the schema does not declare, fills in defaults for missing required arguments where a default exists, and raises `ValueError` if a truly required argument is absent.
+
+### Async tools
+
+`@tool` works on `async def` functions with no extra ceremony. infy detects the coroutine and awaits it. A sync tool called from an async agent is run in a thread pool so it never blocks the event loop.
+
+```python
+import httpx
+from infy import tool
+
+@tool
+async def fetch_title(url: str) -> str:
+    """Fetch a URL and return its HTML <title>."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url)
+    return resp.text.split("<title>")[1].split("</title>")[0]
+```
+
+### Governance metadata
+
+`@tool` accepts optional keyword arguments that describe a tool's risk profile. They are inert on their own and are consumed only when you attach a [Governance](/governance/overview) object to the agent. They cost nothing if you never opt in.
+
+```python
+from infy import tool
+
+@tool(verb="EXECUTE", risk_tier="high", side_effect=True)
+def deploy(service: str) -> str:
+    """Deploy a service to production."""
+    ...
+```
+
+The available fields are `name`, `risk_tier` (`low`, `medium`, `high`, or `critical`), `verb` (for example `READ`, `WRITE`, `EXECUTE`, `NETWORK`, `DB`, `FS`, `EXTERNAL_API`, `FINANCIAL`, `SENSITIVE_DATA`), `reversibility`, `blast_radius`, `cost_class`, `side_effect`, and `scopes`.
+
+<Tip>
+  Set `side_effect=True` on any tool that changes state. An unprofiled side-effecting tool is treated as HIGH risk and escalated to a human approver by default once governance is enabled, so this flag is your safety net.
+</Tip>
+
+## Run an agent
+
+Pass a model and a list of tools to `create_agent`. It returns a plain callable. Call it with a string or a list of messages and it returns an `AgentResult`.
+
+```python
+from infy import create_agent, tool
+from infy.providers.openai import OpenAIChat
+
+model = OpenAIChat("gpt-4o")
+
+@tool
+def get_weather(city: str) -> str:
+    """Return the current weather for a city."""
+    return f"{city}: 17C, clear"
+
+agent = create_agent(model, tools=[get_weather])
+result = agent("What's the weather in Boston?")
+
+print(result.response.text)
+print(result.iterations, result.tool_calls_made)
+```
+
+### Options
+
+`create_agent` and `create_async_agent` take the same keyword arguments.
+
+<ParamField path="model" type="ChatModel" required>
+  The chat model that drives the loop.
+</ParamField>
+
+<ParamField path="tools" type="list[Tool] | None">
+  The tools the model may call. Omit it for a plain chat loop with no tools.
+</ParamField>
+
+<ParamField path="system_prompt" type="str | None">
+  A system message prepended to the conversation.
+</ParamField>
+
+<ParamField path="max_iterations" type="int" default="10">
+  The maximum number of model turns before the loop stops and returns.
+</ParamField>
+
+<ParamField path="parallel_tools" type="bool" default="True">
+  When the model requests several tools in one turn, run them concurrently. Set to `False` to run them in order.
+</ParamField>
+
+<ParamField path="governance" type="Governance | None">
+  An optional in-process control plane. When set, every tool call is policy-checked and every step is audited. See [Governance](/governance/overview).
+</ParamField>
+
+### Async agents
+
+`create_async_agent` has the identical signature and returns a coroutine function. Await the call to get your `AgentResult`.
+
+<CodeGroup>
+```python Sync
+from infy import create_agent
+
+agent = create_agent(model, tools=[get_weather])
+result = agent("What's the weather in Boston?")
+print(result.response.text)
+```
+
+```python Async
+from infy import create_async_agent
+
+agent = create_async_agent(model, tools=[get_weather])
+result = await agent("What's the weather in Boston?")
+print(result.response.text)
+```
+</CodeGroup>
+
+## The AgentResult
+
+Every run returns an `AgentResult` with these fields.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `messages` | `list[Message]` | The full conversation, including tool calls and tool results. |
+| `response` | `AIMessage` | The final model message. Read `response.text` for the answer. |
+| `iterations` | `int` | How many model turns the loop took. |
+| `tool_calls_made` | `int` | Total number of tool calls across all turns. |
+| `status` | `str` | `"completed"`, or `"suspended"` when a durable approval is pending. |
+| `pending_approvals` | `list[PendingApproval]` | Approvals awaiting a human decision. Empty unless suspended. |
+| `run_id` | `str | None` | The run identifier, set for durable runs. |
+
+<Info>
+  `status`, `pending_approvals`, and `run_id` are only meaningful with durable approval via `DurableAgent`. For a plain `create_agent` run, `status` is always `"completed"`. See [Durable approval](/governance/durable-approval).
+</Info>
+
+## Every tool call gets a result
+
+infy guarantees exactly one result message per tool call, even in failure cases. An unknown tool name, a raised exception inside a tool, or a governance denial all produce a `ToolMessage` with `status="error"` rather than a missing entry. This keeps the conversation well-formed, since most providers reject a request where a tool call has no matching result.
+
+## When to use the graph instead
+
+`create_agent` is a fixed loop: model, tools, repeat, stop. That is the right shape for most agents. Reach for the [graph runtime](/graph/overview) when your control flow needs more than a loop:
+
+<CardGroup cols={2}>
+  <Card title="Branching" icon="code-branch">
+    Route to different paths based on state, not just tool calls.
+  </Card>
+  <Card title="Persistence" icon="database">
+    Checkpoint state and resume a run later.
+  </Card>
+  <Card title="Interrupts" icon="pause">
+    Pause for input mid-run and continue where you left off.
+  </Card>
+  <Card title="Custom loops" icon="repeat">
+    Multi-agent hand-offs, retries, and cycles you define yourself.
+  </Card>
+</CardGroup>
+
+The graph is a Pregel-style `StateGraph` with checkpointing and interrupts, in both sync and async. The agent loop is the fast path; the graph is the escape hatch.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Governance" icon="shield-check" href="/governance/overview">
+    Add deny-by-default policy, human approval, and a tamper-evident audit to any agent.
+  </Card>
+  <Card title="The graph runtime" icon="diagram-project" href="/graph/overview">
+    Build branching, persistent, interruptible workflows.
+  </Card>
+</CardGroup>

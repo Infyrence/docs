@@ -1,0 +1,68 @@
+---
+title: "Open core and commercial"
+description: "What is free forever, and what Infyrence operates."
+---
+
+infy is open core under Apache-2.0. Everything in the repository is free to use, self-host, and build on, forever. That includes the full in-process governance library, not a stripped demo of it. The commercial Infyrence layer is a separate, operated surface that begins where in-process enforcement ends, at the network boundary. It attaches behind the same open protocol seams, so adopting it is never a fork and never a rewrite.
+
+## What is free forever
+
+The `infy` package on this repository is Apache-2.0 in its entirety. The framework and the governance library are one codebase, and the governance library is not gated:
+
+- The chat-model abstraction, composable runnables, structured output, `create_agent`, and the `StateGraph` runtime.
+- The `Policy` engine with deny-by-default, fail-closed, Cedar-style semantics behind the `PolicyEngine` protocol.
+- Risk tiering, the `Approver` protocol, `CallbackApprover`, and the durable-approval primitives (`DurableAgent`, `DurableApprover`, `InMemoryApprovalStore`).
+- The local, hash-chained, tamper-evident audit log with `verify()`.
+- The framework integrations in `infy.integrations` that govern smolagents, LangChain, and OpenHands agents.
+
+<Note>
+The enforcement code is open on purpose. A control plane you cannot read is one you cannot trust, so the policy engine, the approval gate, and the audit chain are all in the repository for you to inspect and self-host.
+</Note>
+
+## What Infyrence operates
+
+The commercial layer is operated by [Infyrence](https://infyrence.com) and is not in this repository. It is the managed, multi-tenant surface for the pieces that are heavy, stateful, or need to live outside the agent process: durable audit storage, hosted human approval, and centrally managed policy.
+
+The split follows a clear line. In-process enforcement stays open and local, because a network hop before every tool call would erase the cold-start and latency advantage that makes infy worth using. Everything past the network boundary is where Infyrence operates.
+
+| Open, Apache-2.0, this repo | Commercial, Infyrence cloud |
+| --- | --- |
+| In-process policy, risk, approval primitives | Multi-tenant policy management, versioning, RBAC |
+| Local hash-chained audit and `verify()` | Durable, WORM-anchored audit sink (tamper-proof), retention, query |
+| `Approver` protocol and callbacks | Hosted approval inbox (Slack, web), identity capture, four-eyes |
+| `PolicyEngine` protocol seam | Embedded Cedar engine, policy-authoring DSL, compliance packs |
+
+## The seams that connect them
+
+The commercial features do not replace the open ones. They implement the same protocols the open library already defines: the `PolicyEngine` seam, the `Approver` protocol, and the audit interface. You can start with the in-process library, self-hosted and free, and later point the same `Governance` object at an operated policy source, approval inbox, or audit sink without touching your agent code.
+
+<Info>
+There is no fork and no lock-in at the enforcement boundary. The protocol seams are the contract, and both the open library and the commercial layer are written against them.
+</Info>
+
+## Why the boundary sits where it does
+
+<Steps>
+  <Step title="Enforcement is in-process by design">
+    Policy checks run at the tool chokepoint in about 50 microseconds. A policy microservice with a network hop before every tool call would erase the cold-start and latency advantage the framework is built for, so enforcement stays local and open.
+  </Step>
+  <Step title="Operated concerns cross the network boundary">
+    Durable audit sinks, hosted approval queues, and multi-tenant policy management are stateful, need to outlive the agent process, and are shared across teams. Those are the commercial layer.
+  </Step>
+  <Step title="The protocol seams keep both sides honest">
+    Because the commercial layer attaches behind `PolicyEngine`, `Approver`, and the audit interface, you can adopt it incrementally and leave it at any time.
+  </Step>
+</Steps>
+
+## Deferred behind the same seams
+
+Some capabilities are designed but held back behind the stable protocol seams until a design partner pulls them: an embedded Cedar engine compiled into `infy_core`, a YAML-to-policy DSL, taint and provenance with egress DLP for prompt-injection defense, plan-level authorization, and capability attenuation across sub-agents. When they land, they attach at the same seams, so nothing you build today is invalidated.
+
+<CardGroup cols={2}>
+  <Card title="Governance overview" icon="shield-halved" href="/governance/overview">
+    How the in-process control plane policy-checks every tool call and writes a tamper-evident audit.
+  </Card>
+  <Card title="Durable approval" icon="clock" href="/governance/durable-approval">
+    Suspend a run for out-of-band human sign-off and resume it hours later, TOCTOU-safe.
+  </Card>
+</CardGroup>

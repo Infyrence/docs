@@ -1,0 +1,165 @@
+---
+title: "Providers"
+description: "OpenAI, Anthropic, Gemini, and Ollama."
+---
+
+Every provider in infy implements the same `ChatModel` protocol, so you can swap one for another without touching the rest of your code. A model built from any provider drops into the same chains, agents, and graphs.
+
+## The ChatModel protocol
+
+Each provider class exposes an identical surface:
+
+| Method | Purpose |
+| --- | --- |
+| `generate` | Synchronous completion. |
+| `agenerate` | Asynchronous completion. |
+| `stream` | Synchronous streaming. |
+| `astream` | Asynchronous streaming. |
+| `bind_tools` | Attach tools for tool calling. |
+| `with_structured_output` | Return a JSON-schema dict or a pydantic model. |
+
+Because the surface is shared, providers are interchangeable. Write your chain, agent, or graph once, then point it at whichever model you want.
+
+```python
+from infy import HumanMessage
+from infy.providers.openai import OpenAIChat
+
+model = OpenAIChat("gpt-4o")
+
+reply = model.generate([HumanMessage(content="Summarize bulk-synchronous parallelism in one sentence.")])
+print(reply.text)
+```
+
+## Available providers
+
+| Provider | Class | Extra | Notes |
+| --- | --- | --- | --- |
+| OpenAI | `infy.providers.openai.OpenAIChat` | `infy[openai]` | Chat, tools, structured output. |
+| Anthropic | `infy.providers.anthropic.AnthropicChat` | `infy[anthropic]` | Chat, tools, structured output. |
+| Google Gemini | `infy.providers.gemini.GeminiChat` | `infy[gemini]` | AI Studio and Vertex (`vertexai=True`). |
+| Ollama | `infy.providers.ollama.OllamaChat` | `infy[ollama]` | Local models. |
+
+<Note>
+Provider SDKs are optional extras. The infy core has no third-party runtime dependencies, so you install only the providers you use.
+</Note>
+
+## Installing a provider
+
+Pick the extra that matches the provider you want.
+
+<CodeGroup>
+```bash OpenAI
+pip install "infy[openai]"
+```
+
+```bash Anthropic
+pip install "infy[anthropic]"
+```
+
+```bash Gemini
+pip install "infy[gemini]"
+```
+
+```bash Ollama
+pip install "infy[ollama]"
+```
+
+```bash All providers
+pip install "infy[all]"
+```
+</CodeGroup>
+
+Every provider needs Python 3.10 or later.
+
+## Provider notes
+
+<Tabs>
+<Tab title="OpenAI">
+Install `infy[openai]`, then construct `OpenAIChat` with a model name.
+
+```python
+from infy.providers.openai import OpenAIChat
+
+model = OpenAIChat("gpt-4o")
+```
+
+Supports chat, tool calling, and structured output.
+</Tab>
+
+<Tab title="Anthropic">
+Install `infy[anthropic]`, then construct `AnthropicChat` with a model name.
+
+```python
+from infy.providers.anthropic import AnthropicChat
+
+model = AnthropicChat("claude-sonnet-4-5")
+```
+
+Supports chat, tool calling, and structured output.
+</Tab>
+
+<Tab title="Gemini">
+Install `infy[gemini]`, then construct `GeminiChat`. The same class targets both Google AI Studio and Vertex AI.
+
+```python
+from infy.providers.gemini import GeminiChat
+
+# Google AI Studio (default)
+model = GeminiChat("gemini-1.5-pro")
+
+# Vertex AI
+vertex_model = GeminiChat("gemini-1.5-pro", vertexai=True)
+```
+
+Pass `vertexai=True` to route through Vertex.
+</Tab>
+
+<Tab title="Ollama">
+Install `infy[ollama]`, then construct `OllamaChat` to run local models.
+
+```python
+from infy.providers.ollama import OllamaChat
+
+model = OllamaChat("llama3")
+```
+</Tab>
+</Tabs>
+
+## Streaming
+
+The same model instance streams synchronously or asynchronously.
+
+```python
+async for chunk in model.astream([HumanMessage(content="Stream me a haiku about schedulers.")]):
+    print(chunk.content, end="", flush=True)
+```
+
+## Structured output
+
+`with_structured_output` accepts either a JSON-schema dict (parsed by the Rust `JsonParser`, no validation) or a pydantic model (parsed and validated by pydantic-core). The return type follows what you pass in.
+
+```python
+from pydantic import BaseModel
+
+class Person(BaseModel):
+    name: str
+    age: int
+
+model.with_structured_output(Person).generate([HumanMessage(content="Maria Chen is 42.")])
+# Person(name='Maria Chen', age=42)
+```
+
+<Tip>
+Validated structured output needs pydantic. Install it with `pip install "infy[pydantic]"`.
+</Tip>
+
+## Where to go next
+
+<CardGroup cols={2}>
+<Card title="Tools and agents" icon="robot" href="/concepts/agents">
+Build tool-calling agents with `create_agent` on any provider.
+</Card>
+<Card title="Governance" icon="shield" href="/governance/overview">
+Policy-check every tool call and write a tamper-evident audit.
+</Card>
+</CardGroup>

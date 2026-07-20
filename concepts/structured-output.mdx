@@ -1,0 +1,142 @@
+---
+title: "Structured output"
+description: "Typed output from a JSON schema or a pydantic model."
+---
+
+Ask a model for JSON and you get a string back. `with_structured_output` closes the gap: it instructs the model to emit JSON that matches a schema, then parses the reply into a typed Python value for you.
+
+The return type follows what you pass in. Hand it a plain dict (a JSON schema) and you get a `dict` back, parsed by the Rust `JsonParser` with no validation. Hand it a pydantic model class and you get a validated model instance back, parsed and validated in one fused pydantic-core call.
+
+## Two modes, one call
+
+`with_structured_output` lives on every `ChatModel`. It returns a `StructuredOutputModel` wrapper that carries the same surface as the underlying model: `generate`, `agenerate`, `stream`, `astream`, `invoke`, and `ainvoke`.
+
+<CodeGroup>
+```python pydantic model
+from pydantic import BaseModel
+from infy import HumanMessage
+
+class Person(BaseModel):
+    name: str
+    age: int
+
+typed = model.with_structured_output(Person)
+result = typed.generate([HumanMessage(content="Maria Chen is 42.")])
+# Person(name='Maria Chen', age=42)  -- a validated instance
+```
+
+```python JSON-schema dict
+from infy import HumanMessage
+
+schema = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "age": {"type": "integer"},
+    },
+    "required": ["name", "age"],
+}
+
+typed = model.with_structured_output(schema)
+result = typed.generate([HumanMessage(content="Maria Chen is 42.")])
+# {'name': 'Maria Chen', 'age': 42}  -- a plain dict, unvalidated
+```
+</CodeGroup>
+
+Both forms also work through the runnable interface, so a structured model drops into a chain with the `|` operator:
+
+```python
+result = typed.invoke("Maria Chen is 42.")
+result = await typed.ainvoke("Maria Chen is 42.")
+```
+
+<Note>
+The pydantic path requires the optional extra: `pip install "infy[pydantic]"`. The dict path has no such requirement, the JSON parser is part of the core.
+</Note>
+
+## How the mode is chosen
+
+The wrapper decides once, at construction, which mode to use. It checks whether `schema` is a pydantic `BaseModel` subclass. If it is, that is the pydantic path. Anything else (a plain dict) is the JSON-schema path.
+
+<Tabs>
+<Tab title="pydantic path">
+- Detected when `schema` is a `BaseModel` subclass.
+- The schema instruction is built from `schema.model_json_schema()`.
+- The reply is parsed and validated with `model_validate_json`, pydantic-core's fused parse-and-validate step.
+- You get a **validated model instance** back.
+- If the model wrapped its JSON in prose or code fences, the wrapper falls back to extracting the JSON with `JsonParser` and then validating. If that also fails, it surfaces the original validation error, not the parser's error.
+</Tab>
+<Tab title="JSON-schema dict path">
+- Used for any `schema` that is not a pydantic model.
+- The schema instruction is built directly from the dict you passed.
+- The reply is parsed with the Rust `JsonParser`.
+- You get a **plain dict** back, with **no validation**. The structure is whatever the model produced.
+</Tab>
+</Tabs>
+
+<Warning>
+The dict path does not validate. `JsonParser` gives you back exactly what the model returned, coerced to Python types, but it does not check types, required fields, or ranges against your schema. If you need those guarantees, use a pydantic model.
+</Warning>
+
+## The instruction is cached
+
+When you call `with_structured_output`, the wrapper serializes your schema into a system message once and stores it. It is not re-serialized on every call.
+
+That system instruction tells the model to return valid JSON conforming to the schema, and only the JSON: no explanation, no markdown, no code fences. On each `generate` call the wrapper prepends this cached `SystemMessage` to your messages, then sends them to the underlying model.
+
+<Tip>
+Because the instruction is computed once and reused, building one `StructuredOutputModel` and calling it many times avoids repeating the schema serialization work per call. Create the wrapper once, then invoke it in your loop.
+</Tip>
+
+## Streaming behavior
+
+`stream` and `astream` yield **partial dicts** as tokens arrive, regardless of which mode you chose. Each chunk is parsed with `JsonParser` in partial mode, so you see the object fill in progressively.
+
+```python
+for partial in typed.stream([HumanMessage(content="Maria Chen is 42.")]):
+    print(partial)
+# {'name': 'Maria'}
+# {'name': 'Maria Chen'}
+# {'name': 'Maria Chen', 'age': 42}
+```
+
+<Warning>
+Pydantic validation applies on `generate` and `agenerate`, not mid-stream. Even when you construct the wrapper with a pydantic model, streaming yields partial **dicts**, not model instances. Chunks that fail to parse are skipped silently, so intermediate partials may be incomplete. To get a validated instance, call `generate` or `agenerate`.
+</Warning>
+
+The async form mirrors the sync one:
+
+```python
+async for partial in typed.astream([HumanMessage(content="Maria Chen is 42.")]):
+    ...
+```
+
+## Tool binding passes through
+
+`StructuredOutputModel` is a wrapper, so it forwards `bind_tools` to the underlying model and returns a new structured wrapper around the tool-bound model. Your schema and its cached parser carry through unchanged.
+
+```python
+typed_with_tools = typed.bind_tools(tools)
+```
+
+## When to use each
+
+<CardGroup cols={2}>
+<Card title="Reach for pydantic" icon="shield-check">
+You want validation, type coercion, and a typed object. Field constraints, required fields, and clear errors matter. You have installed `infy[pydantic]`.
+</Card>
+<Card title="Reach for a dict schema" icon="feather">
+You want the lightest path with zero extra dependencies. You are comfortable handling an unvalidated `dict`, or you validate downstream yourself.
+</Card>
+</CardGroup>
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Chat models" icon="robot" href="/concepts/models">
+The `ChatModel` protocol that `with_structured_output` extends.
+</Card>
+<Card title="Composition" icon="link" href="/concepts/composition">
+Chain a structured model with other runnables using the `|` operator.
+</Card>
+</CardGroup>

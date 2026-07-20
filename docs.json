@@ -17,7 +17,53 @@
         "group": "Getting Started",
         "pages": [
           "index",
+          "installation",
           "quickstart"
+        ]
+      },
+      {
+        "group": "Core concepts",
+        "pages": [
+          "concepts/models",
+          "concepts/composition",
+          "concepts/structured-output",
+          "concepts/agents"
+        ]
+      },
+      {
+        "group": "Graph runtime",
+        "pages": [
+          "graph/overview",
+          "graph/checkpointing"
+        ]
+      },
+      {
+        "group": "Governance",
+        "pages": [
+          "governance/overview",
+          "governance/policy",
+          "governance/risk",
+          "governance/approval",
+          "governance/durable-approval",
+          "governance/audit"
+        ]
+      },
+      {
+        "group": "Integrations",
+        "pages": [
+          "integrations/overview",
+          "integrations/smolagents",
+          "integrations/langchain",
+          "integrations/openhands"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "providers",
+          "performance",
+          "architecture",
+          "open-core"
         ]
       }
     ]
@@ -37,7 +83,7 @@
     "primary": {
       "type": "button",
       "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "href": "https://app.infyrence.com"
     }
   },
   "contextual": {

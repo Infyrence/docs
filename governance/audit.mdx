@@ -1,0 +1,171 @@
+---
+title: "Tamper-evident audit"
+description: "A hash-chained log you can verify."
+---
+
+Every governance decision writes exactly one record to an append-only log. Each record chains the one before it with a cryptographic hash, so `verify()` can prove that no record was added, removed, reordered, or altered. This is the receipt that turns "the agent behaved" into something you can hand an auditor.
+
+The `AuditLog` lives in `infy/governance/audit.py`. It is zero-dependency (stdlib `hashlib`, `hmac`, `json`, `threading`) and thread-safe.
+
+## The receipt
+
+`Governance` writes one `AuditEvent` per tool decision. You read them off `gov.audit`:
+
+```python
+from infy import create_agent
+from infy.governance import Governance, Policy
+
+gov = Governance(policy=Policy(require_approval=["deploy"]))
+agent = create_agent(model, tools=[search, deploy], governance=gov)
+agent("ship the release")
+
+for event in gov.audit.events:
+    print(event.seq, event.action, event.decision, event.risk_tier)
+
+assert gov.audit.verify()   # the chain is intact
+```
+
+`gov.audit.events` returns a copy of the list, so iterating it never mutates the log.
+
+## What a record contains
+
+Each `AuditEvent` is a frozen dataclass with these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `seq` | Position in the chain, starting at 0. |
+| `ts` | Wall-clock time (`time.time()`) when the record was written. |
+| `actor` | The principal the decision was made for. |
+| `action` | The tool or model call. |
+| `resource` | What the action targeted. |
+| `decision` | The outcome, for example `allow` or `deny`. |
+| `risk_tier` | The tier the `RiskEngine` assigned. |
+| `reasons` | A tuple of strings explaining the decision. |
+| `args_digest` | A hash of the call arguments (see below). |
+| `prev_hash` | The `hash` of the previous record. |
+| `hash` | This record's chain hash. |
+
+## The hash chain
+
+When you call `record()`, the log takes a lock, reads the previous record's `hash`, and computes this record's `hash` over its own body plus that `prev_hash`. The first record chains from `GENESIS`, a string of 64 zeros.
+
+```python
+GENESIS = "0" * 64
+```
+
+Because every record's hash folds in the previous hash, the records form a chain. Change any field of any historical record and its hash no longer matches. Delete or reorder a record and the `prev_hash` links no longer line up. Either way, `verify()` returns `False`.
+
+<Note>
+The seq read, hash, list append, and file write all happen inside one `threading.Lock`, so concurrent tool calls cannot interleave and corrupt the chain.
+</Note>
+
+### How verify works
+
+`verify()` walks the log from `GENESIS`, recomputing each record's expected hash and checking two things per record: that its `prev_hash` equals the running previous hash, and that its stored `hash` equals the recomputed one.
+
+```python
+def verify(self) -> bool:
+    prev = GENESIS
+    for event in self._events:
+        expected = _chain_hash(self.key, seq=event.seq, ts=event.ts, ...)
+        if event.prev_hash != prev or event.hash != expected:
+            return False
+        prev = event.hash
+    return True
+```
+
+It returns `True` only if no record was added, removed, reordered, or altered.
+
+## The args digest
+
+The log never stores raw call arguments. It stores `args_digest`, a SHA-256 of the canonicalized arguments. Canonicalization uses sorted keys and compact separators, so the digest is stable across dict ordering.
+
+```python
+def _canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      allow_nan=False, default=str)
+```
+
+Two details matter. `allow_nan=False` fails closed on `NaN` or `Infinity` rather than emitting invalid JSON. And "no arguments" is recorded as the empty string `_NO_ARGS`, which is distinct from the hash of `{}`, so an absent-args call and an empty-args call never collide.
+
+<Tip>
+The digest lets you prove later that a specific set of arguments was the one seen at decision time, without persisting the arguments themselves. Keep the originals elsewhere if you need to reproduce the exact values.
+</Tip>
+
+## The optional off-box key
+
+By default the chain uses plain SHA-256. Pass `key=` to switch every link to HMAC-SHA256:
+
+```python
+from infy.governance import AuditLog
+
+audit = AuditLog(path="audit.jsonl", key=SECRET_KEY_BYTES)
+```
+
+The same `key` is used by both `record()` and `verify()`. Hold it outside the agent process. That is the whole point of the next section.
+
+## Tamper-evident, not tamper-proof
+
+Be clear-eyed about the threat model.
+
+A plain SHA-256 chain is self-anchored. An attacker who controls the process can edit a record and simply recompute every hash after it. `verify()` would pass on the forged chain. SHA-256 alone proves integrity against accidental corruption and against anyone who cannot rerun your code, not against the process itself.
+
+The HMAC key closes that gap. If the key lives outside the agent process, forging the chain requires the key, which the compromised process does not have.
+
+<Warning>
+Without a key held off-box, the audit log is tamper-evident against outside edits but not tamper-proof against the process that writes it. For production, use `AuditLog(key=...)` and anchor the head hash to an external notary or WORM sink. External anchoring is on the roadmap, not shipped.
+</Warning>
+
+## Persisting to disk
+
+Pass `path=` to mirror every record as one JSON line (JSONL):
+
+```python
+audit = AuditLog(path="audit.jsonl")
+```
+
+The file write happens inside the same lock as the append, so the file and the in-memory list stay in step. Today the JSONL mirror is an append-only export. It is not yet read back and reconciled on startup, so `verify()` checks the in-memory chain for the current process.
+
+## How it maps to compliance
+
+The hash chain is the evidence artifact two frameworks expect.
+
+<CardGroup cols={2}>
+  <Card title="SOC 2" icon="shield-check">
+    The chain supports the CC6, CC7, and CC8 criteria: a durable, integrity-protected record of who did what, under which decision, that database permissions alone cannot provide.
+  </Card>
+  <Card title="EU AI Act" icon="scale-balanced">
+    Article 12 expects automatic logging of events over an AI system's lifetime. An append-only, verifiable chain is the record-keeping evidence that obligation calls for.
+  </Card>
+</CardGroup>
+
+<Info>
+The framework gives you the mechanism (an append-only, verifiable log with an off-box key option). Mapping it to a specific control set, retention policy, and external anchor is your deployment's responsibility.
+</Info>
+
+## Known gaps
+
+The audit log ships as an MVP. These limits are deferred on purpose, not silently missing:
+
+<AccordionGroup>
+  <Accordion title="No external anchor yet">
+    The head hash is not yet anchored to an external notary or WORM sink. Until it is, a process with the HMAC key could still regenerate the chain.
+  </Accordion>
+  <Accordion title="No approver identity capture">
+    Records capture the decision but not who approved it. Segregation of duties (four-eyes) is on the roadmap, so a maker can currently approve their own action.
+  </Accordion>
+  <Accordion title="JSONL is export-only">
+    The disk mirror is written but not read back and reconciled on startup.
+  </Accordion>
+</AccordionGroup>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Governance overview" icon="sitemap" href="/governance/overview">
+    How policy, risk, approval, and audit fit the agent loop.
+  </Card>
+  <Card title="Durable approval" icon="clock" href="/governance/approval">
+    Human-in-the-loop gates that can suspend a run and resume later.
+  </Card>
+</CardGroup>

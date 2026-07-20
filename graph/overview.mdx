@@ -1,0 +1,222 @@
+---
+title: "The graph runtime"
+description: "A Pregel-style superstep engine with typed channels."
+---
+
+<Info>
+  `StateGraph` is a Pregel-style superstep engine. You declare a typed state, register nodes and edges, then `compile()` to an executable graph that runs sync or async with identical semantics. It is LangGraph-compatible in shape, in about 360 lines.
+</Info>
+
+## The mental model
+
+A graph is a set of **nodes** (functions) connected by **edges**. Execution runs in **supersteps**. In each superstep, every node in the active **frontier** runs against one frozen snapshot of the state. Their writes are batched, then committed through **channels** (so reducers actually reduce). The next frontier is the union of every active node's successors. That union is what makes real fan-out and diamond joins work.
+
+```text
+superstep N:
+  1. freeze a snapshot of all channels
+  2. run every node in the frontier against that snapshot
+  3. collect their return values as pending writes
+  4. commit the writes through the channels (reducers fire here)
+  5. compute the next frontier from the nodes that ran
+```
+
+State never changes underneath a running node. A node reads a consistent snapshot and returns a partial update. Nothing is applied until the whole frontier has run.
+
+## Typed state
+
+State is a `TypedDict`. You pass the class to `StateGraph`. Each field becomes a channel:
+
+- A plain field becomes a `LastValue` channel. It accepts exactly one write per superstep.
+- An `Annotated[type, reducer]` field becomes a `BinOp` channel. It folds every write of the superstep through the reducer, so multiple nodes can contribute.
+
+```python
+import operator
+from typing import Annotated, TypedDict
+
+from infy import StateGraph, START, END
+
+class State(TypedDict):
+    messages: Annotated[list, operator.add]   # BinOp: appended across supersteps
+    step_count: Annotated[int, operator.add]  # BinOp: summed
+    next_action: str                          # LastValue: one write per step
+```
+
+The reducer is any binary callable `f(current, new)`. `operator.add` concatenates lists and sums numbers. You can pass your own function for custom merge logic.
+
+<Warning>
+  A `LastValue` field raises `InvalidUpdateError` if two nodes write it in the same superstep. Use an `Annotated[type, reducer]` field when more than one node needs to contribute to a value.
+</Warning>
+
+### How channels are inferred
+
+`StateGraph` reads the schema's type hints with `include_extras=True`. If a field's annotation carries metadata whose first element is callable, that callable is the reducer and the field becomes `BinOp`. Every other field becomes `LastValue`. If you pass no schema (or `dict`), channels are created on demand as `LastValue` when a node first writes a key.
+
+The three channel types live in `infy.graph.channels`:
+
+| Channel | Behavior | Backs |
+| --- | --- | --- |
+| `LastValue` | keeps the last value, one write per step | plain fields |
+| `BinOp` | folds writes through a reducer | `Annotated[type, reducer]` fields |
+| `Topic` | accumulates into a list | message-history style channels |
+
+## Nodes
+
+A node is a function that takes the current state dict and returns one of:
+
+- a partial state dict to merge through the channels,
+- a `Command` (to update state and/or jump to a node),
+- or `None` (no writes).
+
+```python
+def call_model(state: State) -> dict:
+    response = model.generate(state["messages"], tools=TOOLS)
+    return {"messages": [response]}
+```
+
+Register nodes with `add_node`. Reserved names `START` and `END` cannot be used. Extra keyword arguments (`retry`, `timeout`) are stored on the node spec.
+
+```python
+graph = StateGraph(State)
+graph.add_node("model", call_model)
+graph.add_node("tools", run_tools)
+```
+
+## Edges
+
+`add_edge(source, target)` is an unconditional edge. A node may have several outgoing edges; all of their targets join the next frontier.
+
+`add_conditional_edges(source, condition, path_map=None, default=None)` routes at runtime. The `condition` receives the current state and returns:
+
+- a node name (looked up in `path_map` if provided, else used directly),
+- a list of node names (fan-out), or
+- a `Send` object or list of `Send` objects (dynamic fan-out with per-task input).
+
+```python
+def route(state: State) -> str:
+    return "tools" if state["messages"][-1].tool_calls else END
+
+graph.add_edge(START, "model")
+graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
+graph.add_edge("tools", "model")
+```
+
+<Tip>
+  Pass `default="fallback"` to `add_conditional_edges` to route to a safe node if the condition function raises. Without a default, the exception propagates.
+</Tip>
+
+## Dynamic fan-out with `Send`
+
+Return `Send(node, arg)` objects from a conditional edge to spawn one task per item. Each task runs `node` with `arg` merged into its input. Plain edge traversals are de-duplicated so diamond joins run the shared node once, but `Send` tasks are always kept distinct, since fan-out tasks are meant to be separate units of work.
+
+```python
+from infy.graph import Send
+
+def fan_out(state: State) -> list:
+    return [Send("worker", item) for item in state["work_items"]]
+
+graph.add_conditional_edges("planner", fan_out)
+```
+
+Under `ainvoke`/`astream`, the tasks in a frontier run concurrently. Writes are still folded in frontier order, so order-sensitive reducers behave the same as the sync path.
+
+## Compile and run
+
+`compile()` validates the graph, builds the channels, and returns a `CompiledGraph`.
+
+```python
+app = graph.compile()
+result = app.invoke({"messages": [HumanMessage(content="...")]})
+```
+
+`compile` accepts:
+
+| Argument | Default | Purpose |
+| --- | --- | --- |
+| `checkpointer` | `None` | persist channel state and the pending frontier per `thread_id` |
+| `interrupt_before` | `[]` | pause before these nodes run |
+| `interrupt_after` | `[]` | pause after these nodes run |
+| `recursion_limit` | `25` | supersteps before `GraphRecursionError` is raised |
+
+### Input handling
+
+`invoke` normalizes its input before the first superstep:
+
+- a dict is applied as channel updates,
+- a bare list is applied as `{"messages": [...]}`,
+- anything else is applied as `{"input": ...}`.
+
+### Sync and async
+
+The compiled graph runs three ways with identical channel, reducer, checkpoint, and interrupt semantics:
+
+<CodeGroup>
+```python invoke (sync)
+result = app.invoke({"messages": [HumanMessage(content="...")]})
+```
+
+```python ainvoke (async)
+result = await app.ainvoke({"messages": [HumanMessage(content="...")]})
+```
+
+```python astream (async, per-superstep)
+async for state in app.astream({"messages": [HumanMessage(content="...")]}):
+    print(state)  # materialized state after each superstep
+```
+</CodeGroup>
+
+<Note>
+  Under `astream` and `ainvoke` the frontier runs concurrently, so a node that raises does not cancel its already-running siblings. The first error in frontier order is surfaced. Keep concurrent nodes side-effect-free or idempotent.
+</Note>
+
+## The canonical agent loop
+
+The tool-calling agent is a two-node graph: a model node, a tools node, and a conditional edge that loops until the model stops asking for tools.
+
+```python
+import operator
+from typing import Annotated, TypedDict
+
+from infy import HumanMessage, StateGraph, START, END
+
+class State(TypedDict):
+    messages: Annotated[list, operator.add]
+
+def call_model(state: State) -> dict:
+    return {"messages": [model.generate(state["messages"], tools=TOOLS)]}
+
+def route(state: State) -> str:
+    return "tools" if state["messages"][-1].tool_calls else END
+
+graph = StateGraph(State)
+graph.add_node("model", call_model)
+graph.add_node("tools", run_tools)
+graph.add_edge(START, "model")
+graph.add_conditional_edges("model", route, {"tools": "tools", END: END})
+graph.add_edge("tools", "model")
+
+app = graph.compile()
+app.invoke({"messages": [HumanMessage(content="What is 12 * 8?")]})
+```
+
+Each turn is one superstep pair: `model` runs, `route` decides, and either `tools` runs and feeds back into `model`, or the loop ends. The `messages` reducer (`operator.add`) accumulates the full transcript across supersteps.
+
+<Tip>
+  You do not have to wire this by hand. `create_graph_agent(model, tools=...)` builds exactly this graph for you, with optional `checkpointer`, `interrupt_before`, and `interrupt_after`.
+</Tip>
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Checkpointing and interrupts" icon="floppy-disk" href="/graph/checkpointing">
+    Persist state per `thread_id`, pause for human input, and resume a run later.
+  </Card>
+  <Card title="Prebuilt graph agent" icon="robot" href="/concepts/agents">
+    Use `create_graph_agent` for the agent loop with state persistence built in.
+  </Card>
+  <Card title="Governance" icon="shield-check" href="/governance/overview">
+    Add deny-by-default policy, approval, and a tamper-evident audit to any run.
+  </Card>
+  <Card title="Runnables" icon="link" href="/concepts/composition">
+    Compose models, parsers, and functions with the `|` operator.
+  </Card>
+</CardGroup>

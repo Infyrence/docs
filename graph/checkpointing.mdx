@@ -1,0 +1,207 @@
+---
+title: "Checkpointing and human-in-the-loop"
+description: "Persist state, pause, and resume."
+---
+
+A checkpointer turns a stateless graph run into a durable, resumable conversation. It persists the channel state and the pending execution frontier after each superstep, keyed by a `thread_id`. That single mechanism is what makes three things possible: inspecting state mid-run, pausing for a human, and resuming exactly where you left off.
+
+## What a checkpointer gives you
+
+When you compile a graph with a checkpointer, every superstep writes a `Checkpoint` to storage. Each checkpoint holds:
+
+- `channel_values`: the materialized state of every channel.
+- `next_tasks`: the frontier, the `[node, arg]` pairs that would run next. Persisting the frontier is what lets an interrupted run continue instead of restarting from `START`.
+
+Without a checkpointer, a graph still runs, but nothing is saved. `get_state`, `update_state`, and interrupts all depend on a checkpointer being attached.
+
+## Enable checkpointing
+
+Pass a checkpointer to `compile`. Use `InMemorySaver` for development and tests. Then invoke with a `thread_id` under the `configurable` key.
+
+```python
+from typing import Annotated, TypedDict
+import operator
+
+from infy import StateGraph, START, END, InMemorySaver
+
+class State(TypedDict):
+    messages: Annotated[list, operator.add]
+
+graph = StateGraph(State)
+graph.add_node("agent", call_model)
+graph.add_edge(START, "agent")
+graph.add_edge("agent", END)
+
+app = graph.compile(checkpointer=InMemorySaver())
+
+config = {"configurable": {"thread_id": "conversation-1"}}
+app.invoke({"messages": [HumanMessage(content="hello")]}, config=config)
+```
+
+<Note>
+Every invocation that shares a `thread_id` accumulates on the same thread. A different `thread_id` starts a fresh, isolated history. If you omit `thread_id`, the runtime generates a random one, so state cannot be recovered later.
+</Note>
+
+You can also set an optional `checkpoint_ns` alongside `thread_id` to namespace checkpoints within a thread.
+
+## Inspect state with `get_state`
+
+`get_state(config)` returns a `StateSnapshot` for the latest checkpoint on the thread.
+
+```python
+snapshot = app.get_state(config)
+
+snapshot.values   # dict: the persisted channel state
+snapshot.next     # list[str]: the nodes that would run next
+snapshot.metadata # dict: includes {"step": <int>}
+```
+
+`StateSnapshot` is frozen (read-only). Internal channels whose names start with `__` are filtered out of `values`. If the thread has no checkpoint yet, `get_state` returns an empty snapshot (`values={}`, `next=[]`).
+
+## Amend state with `update_state`
+
+`update_state(config, values, as_node=None)` merges `values` into the persisted state and writes a new checkpoint. Use it to correct or inject state before resuming a paused run.
+
+```python
+app.update_state(config, {"messages": [HumanMessage(content="use metric units")]})
+```
+
+The merged values are applied on top of the current `channel_values`, and the resulting checkpoint is tagged with `source="update"`. `update_state` returns the thread config pointing at the new checkpoint.
+
+<Warning>
+`update_state` assigns into `channel_values` directly. It replaces the value at each key rather than routing through a channel reducer, so an `operator.add` field is overwritten by what you pass, not appended to. Pass the full intended value for that key.
+</Warning>
+
+## Pause before or after a node
+
+Declare interrupt points at compile time. `interrupt_before` pauses the run just before any listed node is about to execute; `interrupt_after` pauses once a listed node has run.
+
+```python
+app = graph.compile(
+    checkpointer=InMemorySaver(),
+    interrupt_before=["tools"],
+)
+```
+
+When the frontier hits an interrupt point, the runtime saves a resumable checkpoint and raises `GraphInterrupt`. Catch it, review the state, then decide whether to continue.
+
+```python
+from infy.graph import GraphInterrupt
+
+config = {"configurable": {"thread_id": "run-42"}}
+
+try:
+    app.invoke({"messages": [HumanMessage(content="delete the row")]}, config=config)
+except GraphInterrupt:
+    snapshot = app.get_state(config)
+    print("paused before:", snapshot.next)   # e.g. ["tools"]
+    # ... obtain a human decision here ...
+```
+
+<Info>
+Interrupts require a checkpointer. The pause is implemented by persisting the frontier, so a graph compiled without one cannot pause and resume.
+</Info>
+
+## Interrupt from inside a node
+
+For a pause that depends on runtime data, raise `NodeInterrupt` inside the node itself. The runtime catches it, checkpoints the current frontier, and surfaces it as a `GraphInterrupt` carrying your value.
+
+```python
+from infy.graph import NodeInterrupt
+
+def review(state: State) -> dict:
+    if state["amount"] > 10_000:
+        raise NodeInterrupt({"reason": "amount exceeds auto-approve limit"})
+    return {"approved": True}
+```
+
+`NodeInterrupt` is a subclass of `GraphInterrupt`, so a single `except GraphInterrupt` handler catches both static interrupt points and in-node interrupts.
+
+## Resume by re-invoking
+
+To continue a paused run, call `invoke` (or `ainvoke`) again with the same `thread_id`. The runtime restores the channels and the saved frontier, and it does not re-trigger the interrupt that paused it. The run picks up from the frontier and drains to completion.
+
+<Steps>
+  <Step title="Run until it pauses">
+    The first `invoke` raises `GraphInterrupt` and persists a checkpoint with the pending frontier.
+  </Step>
+  <Step title="Inspect or amend (optional)">
+    Call `get_state` to see what runs next, and `update_state` to inject a human decision.
+  </Step>
+  <Step title="Resume">
+    Re-invoke with the same `config`. Execution continues from the saved frontier.
+  </Step>
+</Steps>
+
+```python
+# 1. runs, then pauses at interrupt_before=["tools"]
+try:
+    app.invoke({"messages": [HumanMessage(content="...")]}, config=config)
+except GraphInterrupt:
+    pass
+
+# 2. optionally amend the persisted state
+app.update_state(config, {"approved": True})
+
+# 3. resume: same thread_id, continues from where it paused
+final = app.invoke(None, config=config)
+```
+
+<Tip>
+Pass `None` as the input to resume without adding anything new. Any input you do pass on resume is applied to the channels before the frontier runs, so you can feed in the human's answer as part of the resuming call.
+</Tip>
+
+The same checkpointing and interrupt semantics apply to the async API: `await app.ainvoke(...)` and `async for step in app.astream(...)` restore and persist state identically.
+
+## Bound runaway loops with `recursion_limit`
+
+Cyclic graphs (an agent that loops between a model and its tools) need a stop condition. `recursion_limit` caps the number of supersteps and raises `GraphRecursionError` instead of looping forever. The default is `25`.
+
+```python
+app = graph.compile(checkpointer=InMemorySaver(), recursion_limit=50)
+```
+
+You can also override it per run through the config:
+
+```python
+config = {"recursion_limit": 100, "configurable": {"thread_id": "1"}}
+app.invoke(inputs, config=config)
+```
+
+`GraphRecursionError` is a subclass of Python's built-in `RecursionError`, and it carries `.limit` and `.current` so you can report how far the run got.
+
+```python
+from infy.graph import GraphRecursionError
+
+try:
+    app.invoke(inputs, config=config)
+except GraphRecursionError as e:
+    print(f"stopped after {e.current} of {e.limit} steps")
+```
+
+## Custom checkpoint backends
+
+`InMemorySaver` is for development and testing; its storage is lost when the process exits. For durable persistence, implement `BaseCheckpointSaver` against your own backend. The key methods are:
+
+| Method | Purpose |
+| --- | --- |
+| `get_tuple(config)` | Fetch the latest `CheckpointTuple` for a thread. |
+| `put(config, checkpoint, metadata, new_versions)` | Store a checkpoint, return updated config. |
+| `put_writes(config, writes, task_id)` | Store intermediate writes. |
+| `list(config, limit=10)` | Iterate checkpoints for a thread, newest first. |
+| `delete_thread(thread_id)` | Remove all checkpoints for a thread. |
+
+Compile with your saver in place of `InMemorySaver`, and everything above (`get_state`, `update_state`, interrupts, resume) works unchanged.
+
+## Where to go next
+
+Checkpointing gives you the plumbing for a human to approve or edit a run in the moment. When you need approvals that survive process restarts and can resume hours later, and a tamper-evident record of what was decided, the governance layer builds on this same substrate.
+
+<CardGroup cols={2}>
+  <Card title="Governance" icon="shield-check" href="/governance/overview">
+    Deny-by-default policy, risk tiering, and durable human approval on the agent loop.
+  </Card>
+  <Card title="StateGraph" icon="diagram-project" href="/graph/overview">
+    Nodes, edges, reducers, and the superstep runtime that checkpointing sits on.
+  </Card>
+</CardGroup>

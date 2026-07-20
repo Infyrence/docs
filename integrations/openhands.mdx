@@ -1,0 +1,183 @@
+---
+title: "OpenHands"
+description: "Govern an OpenHands agent via its SecurityAnalyzer."
+---
+
+OpenHands' Software Agent SDK routes every action through a `SecurityAnalyzer` that returns a `SecurityRisk`, and a `ConfirmationPolicy` decides what to do with that risk. By default OpenHands lets its LLM guess the risk. `infy.integrations.openhands` replaces that guess with infy's deterministic policy and risk engine, and records every action to infy's tamper-evident, hash-chained audit trail.
+
+<Info>
+The confirmation gate stays OpenHands' own. infy contributes the deterministic classification and the cryptographic audit. OpenHands' `ConfirmationPolicy` still decides whether a given risk level pauses for a human.
+</Info>
+
+## How it fits
+
+The adapter is deliberately split into two layers.
+
+<CardGroup cols={2}>
+  <Card title="assess_action" icon="scale-balanced">
+    The SDK-free core. Runs one action through infy's policy, risk, and audit, and returns the OpenHands risk plus whether the policy permits it. Fully unit-tested.
+  </Card>
+  <Card title="build_analyzer" icon="plug">
+    The thin wrapper that plugs the core into a real OpenHands `SecurityAnalyzerBase`. Imports `openhands.sdk` lazily, so importing the module never requires the SDK.
+  </Card>
+</CardGroup>
+
+## Install
+
+<CodeGroup>
+```bash infy
+pip install infy
+```
+
+```bash OpenHands SDK
+pip install openhands-sdk
+```
+</CodeGroup>
+
+`assess_action` needs only infy. You install `openhands-sdk` only to call `build_analyzer`.
+
+## The core: assess_action
+
+`assess_action` is the tested heart of the integration. It takes a `Governance` object and one action, and returns a `(openhands_risk, allowed)` tuple.
+
+```python
+def assess_action(
+    governance: Governance,
+    *,
+    tool_name: str,
+    args: dict[str, Any],
+    verb: str | None = None,
+    risk_tier: str | None = None,
+    side_effect: bool = True,
+) -> tuple[str, bool]:
+    ...
+```
+
+Internally it does four things, in order:
+
+<Steps>
+  <Step title="Classify risk">
+    It builds tool metadata (`verb`, `risk_tier`, `side_effect`) and calls `governance.risk.assess` to get an infy risk tier.
+  </Step>
+  <Step title="Evaluate policy">
+    It builds an `AuthRequest` for `invoke_tool` on `tool_name` and calls `governance.policy.evaluate`. The action is `allowed` unless the decision effect is `Effect.FORBID`.
+  </Step>
+  <Step title="Audit">
+    It calls `governance.audit.record` with the actor, action, resource, decision (`allow` or `deny`), risk tier, reasons, and args. Every action is written, allowed or not.
+  </Step>
+  <Step title="Map to a SecurityRisk value">
+    It maps the infy tier to an OpenHands risk string. A policy denial is always surfaced as `"HIGH"`.
+  </Step>
+</Steps>
+
+### Risk mapping
+
+The infy risk tier maps to OpenHands `SecurityRisk` values as follows.
+
+| infy tier  | OpenHands `SecurityRisk` |
+| ---------- | ------------------------ |
+| `low`      | `LOW`                    |
+| `medium`   | `MEDIUM`                 |
+| `high`     | `HIGH`                   |
+| `critical` | `HIGH`                   |
+
+<Note>
+OpenHands' top tier is `HIGH`, so infy's `critical` folds into `HIGH`. A policy `FORBID` is also surfaced as `HIGH`, regardless of the computed tier, so OpenHands' `ConfirmationPolicy` stops it.
+</Note>
+
+### Example
+
+```python
+from infy.governance import AuditLog, Governance, Policy
+from infy.integrations.openhands import assess_action
+
+audit = AuditLog()
+gov = Governance(
+    policy=Policy(allow=["read", "edit", "cmd", "net"], deny=["delete_all"]),
+    audit=audit,
+    principal="agent://openhands",
+    escalate_at=None,
+)
+
+# An allowed read classifies as LOW and passes.
+risk, allowed = assess_action(
+    gov, tool_name="read", args={"path": "config.yaml"}, verb="READ", risk_tier="low"
+)
+assert risk == "LOW" and allowed is True
+
+# A denylisted action is forced to HIGH and blocked.
+risk, allowed = assess_action(
+    gov, tool_name="delete_all", args={"target": "orders_prod"}, verb="DB", risk_tier="critical"
+)
+assert risk == "HIGH" and allowed is False
+
+# Every action, allowed or denied, is on the tamper-evident chain.
+assert audit.verify()
+```
+
+Because the `Policy` here is deny-by-default, an unlisted tool such as `exfiltrate` is denied and surfaced as `HIGH` even though it is not on the deny list.
+
+## Wiring it into OpenHands: build_analyzer
+
+`build_analyzer` returns a `SecurityAnalyzerBase` subclass whose `security_risk` method delegates to `assess_action`.
+
+```python
+def build_analyzer(
+    governance: Governance,
+    *,
+    risk: dict[str, dict[str, Any]] | None = None,
+    extract: Callable[[Any], tuple[str, dict[str, Any]]] | None = None,
+) -> Any:
+    ...
+```
+
+- `risk` maps a tool name to `{"verb", "risk_tier", "side_effect"}`. These profiles feed `assess_action`.
+- `extract` overrides how `(tool_name, args)` are read from an action event. The default, `_default_extract`, tries the common action fields (`tool_name`, `action`, `arguments`, `args`) and falls back to the class name.
+
+```python
+from infy.integrations.openhands import build_analyzer
+
+analyzer = build_analyzer(
+    gov,
+    risk={"cmd": {"verb": "EXECUTE", "risk_tier": "high"}},
+)
+```
+
+Register the returned analyzer with an OpenHands conversation or agent as its security analyzer, alongside a `ConfirmationPolicy` (for example `ConfirmRisky`). The analyzer classifies and audits every action; the confirmation policy decides what a given risk level does.
+
+<Warning>
+`build_analyzer` imports `openhands.sdk` lazily, so nothing forces the SDK at module import time. The mapping it delegates to (`assess_action`) is fully covered by tests, but the SDK wiring itself has not been exercised in an environment where `openhands-sdk` installs. Smoke-test `build_analyzer` on a host where `pip install openhands-sdk` succeeds, and confirm your SDK version's action shape matches `_default_extract` (pass a custom `extract` if it does not).
+</Warning>
+
+## Action-shape extraction
+
+OpenHands action objects vary by SDK version, so `_default_extract` is best-effort. It reads the tool name from the first of `tool_name`, `action`, or the action's class name, and the arguments from `arguments` or `args`, coercing non-dict values into a `{"value": ...}` dict. If your SDK version exposes different fields, supply your own `extract`.
+
+```python
+def my_extract(action):
+    return action.tool, dict(action.kwargs)
+
+analyzer = build_analyzer(gov, extract=my_extract)
+```
+
+## What is tested
+
+<Accordion title="Covered by tests/test_openhands_governance.py">
+- Denylisted actions return `HIGH` and `allowed is False`, and are audited as a deny.
+- Unlisted actions are denied by default and surfaced as `HIGH`.
+- Allowed reads return `LOW` and `allowed is True`.
+- Risk tiers map to OpenHands levels, with `critical` folding into `HIGH`.
+- Every action is audited, and the chain passes `audit.verify()`.
+- `build_analyzer` imports the SDK lazily: with no SDK present, calling it raises `ImportError` or `ModuleNotFoundError`, proving importing the integration module never required the SDK.
+</Accordion>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Governance overview" icon="shield" href="/governance/overview">
+    The policy, risk, approval, and audit engine behind this adapter.
+  </Card>
+  <Card title="Audit trail" icon="fingerprint" href="/governance/audit">
+    The tamper-evident, hash-chained log and its `verify()`.
+  </Card>
+</CardGroup>

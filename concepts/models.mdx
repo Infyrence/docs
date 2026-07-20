@@ -1,0 +1,245 @@
+---
+title: "Messages and models"
+description: "The message types and the ChatModel protocol."
+---
+
+Every conversation in infy is a list of messages, and every provider speaks the same `ChatModel` protocol. Four message dataclasses carry the content, and one protocol defines the six methods every model implements. This page covers both.
+
+## The message types
+
+infy has four message types, defined as plain dataclasses in `infy/messages.py`. There is no deep class hierarchy: each type is a small dataclass with a `type` property and a `text` property.
+
+| Class | `type` | Role |
+| --- | --- | --- |
+| `HumanMessage` | `"human"` | User input |
+| `AIMessage` | `"ai"` | Model output |
+| `SystemMessage` | `"system"` | System instruction |
+| `ToolMessage` | `"tool"` | Tool execution result |
+
+The union `Message = HumanMessage | AIMessage | SystemMessage | ToolMessage` is what every model method accepts as a list.
+
+```python
+from infy import HumanMessage
+from infy.messages import SystemMessage, AIMessage, ToolMessage
+
+conversation = [
+    SystemMessage(content="You are a concise assistant."),
+    HumanMessage(content="Summarize bulk-synchronous parallelism in one sentence."),
+]
+```
+
+### HumanMessage
+
+`HumanMessage` holds user input. Its `content` is either a string or a list of content blocks (`TextBlock`, `ImageBlock`, `ToolCallBlock`, `ToolResultBlock`). The `name` and `id` fields are optional.
+
+```python
+msg = HumanMessage(content="What is the capital of France?")
+msg.text   # "What is the capital of France?"
+msg.type   # "human"
+```
+
+The `text` property always returns a plain string. If `content` is a list of blocks, it concatenates the text of each block, so you can read `.text` regardless of how the message was built.
+
+### AIMessage
+
+`AIMessage` is what a model returns. It carries the generated `content`, plus tool calls, usage metadata, and response metadata.
+
+```python
+reply = model.generate([HumanMessage(content="Hello")])
+
+reply.text            # the generated text
+reply.tool_calls      # list[ToolCall], empty if none
+reply.has_tool_calls  # True if the model requested any tool
+reply.usage           # UsageMetadata | None
+```
+
+<Info>
+`has_tool_calls` is a convenience property: it returns `True` when `tool_calls` is non-empty. Use it to decide whether to run tools before continuing the loop.
+</Info>
+
+Each entry in `tool_calls` is a `ToolCall` with `name`, `args` (a `dict`), and `id`. Usage is a `UsageMetadata` with `input_tokens`, `output_tokens`, and `total_tokens` (the total is computed automatically when not supplied).
+
+### SystemMessage
+
+`SystemMessage` holds a system instruction. It has `content` and an optional `name`, plus the same `text` property.
+
+```python
+SystemMessage(content="Answer only in JSON.")
+```
+
+### ToolMessage
+
+`ToolMessage` reports the result of running a tool back to the model. Unlike the other three, its `content` is always a string, and it must reference the `tool_call_id` it answers.
+
+```python
+ToolMessage(
+    content="72F and sunny",
+    tool_call_id=call.id,
+    name="get_weather",
+    status="success",   # or "error"
+)
+```
+
+The optional `artifact` field lets you attach a richer object (for example a dataframe) alongside the string content, and `status` records whether the tool succeeded.
+
+## The ChatModel protocol
+
+`ChatModel` in `infy/models.py` is a `runtime_checkable` `Protocol`. It is the entire contract for a chat model: one `model_name` attribute and six methods. Every provider (OpenAI, Anthropic, Gemini/Vertex, Ollama) implements it, so models are interchangeable in chains, agents, and graphs.
+
+```python
+from infy import HumanMessage
+from infy.providers.openai import OpenAIChat
+
+model = OpenAIChat("gpt-4o")
+reply = model.generate([HumanMessage(content="Hello in one word.")])
+print(reply.text)
+```
+
+### generate and agenerate
+
+`generate` runs one completion and returns an `AIMessage`. `agenerate` is the async equivalent, awaitable and identical in signature.
+
+<CodeGroup>
+```python Sync
+reply = model.generate(
+    [HumanMessage(content="Name three primary colors.")],
+    temperature=0,
+    max_tokens=64,
+)
+print(reply.text)
+```
+
+```python Async
+reply = await model.agenerate(
+    [HumanMessage(content="Name three primary colors.")],
+    temperature=0,
+    max_tokens=64,
+)
+print(reply.text)
+```
+</CodeGroup>
+
+Both accept the same keyword arguments: `tools`, `tool_choice`, `temperature`, `max_tokens`, and any extra provider `kwargs`.
+
+### stream and astream
+
+`stream` yields `AIMessageChunk` objects as tokens arrive. `astream` is the async generator form, iterated with `async for`.
+
+<CodeGroup>
+```python Sync
+for chunk in model.stream([HumanMessage(content="Count to five.")]):
+    print(chunk.text, end="", flush=True)
+```
+
+```python Async
+async for chunk in model.astream([HumanMessage(content="Count to five.")]):
+    print(chunk.text, end="", flush=True)
+```
+</CodeGroup>
+
+`AIMessageChunk` is additive: you can fold a stream into a single chunk with `+`, then call `materialize()` to get a complete `AIMessage` (with parsed tool calls and summed usage).
+
+```python
+from functools import reduce
+
+chunks = list(model.stream([HumanMessage(content="Count to five.")]))
+final = reduce(lambda a, b: a + b, chunks)
+message = final.materialize()   # AIMessage
+```
+
+<Note>
+`astream` is declared as a plain `def` that returns an `AsyncIterator`, not as an `async def`. You iterate its return value with `async for`; you do not `await` the call itself.
+</Note>
+
+### bind_tools
+
+`bind_tools` returns a `BoundChatModel` with tools pre-attached, so you do not pass `tools=` on every call. Tools are `ToolSchema` objects (`name`, `description`, `parameters`).
+
+```python
+from infy.models import ToolSchema
+
+get_weather = ToolSchema(
+    name="get_weather",
+    description="Get the weather for a city.",
+    parameters={
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+)
+
+bound = model.bind_tools([get_weather])
+reply = bound.generate([HumanMessage(content="Weather in Paris?")])
+
+if reply.has_tool_calls:
+    for call in reply.tool_calls:
+        print(call.name, call.args)
+```
+
+`BoundChatModel` exposes the same `generate`, `agenerate`, `stream`, and `astream` methods, forwarding the bound tools on each call. You can call `bind_tools` again to replace them, or `with_structured_output` on top.
+
+### with_structured_output
+
+`with_structured_output` returns a `StructuredOutputModel` that instructs the model to reply as JSON and parses the reply for you. It accepts two kinds of schema:
+
+- A **pydantic model class**: the reply is validated with `model_validate_json`, and the **validated instance** is returned. This requires pydantic (`pip install infy[pydantic]`).
+- A **plain dict** (JSON schema): the reply is parsed by the Rust `JsonParser` and a **dict** is returned, with no validation.
+
+<CodeGroup>
+```python Pydantic
+from pydantic import BaseModel
+from infy import HumanMessage
+
+class Person(BaseModel):
+    name: str
+    age: int
+
+structured = model.with_structured_output(Person)
+person = structured.generate([HumanMessage(content="Maria Chen is 42.")])
+person.name   # "Maria Chen"
+person.age    # 42
+```
+
+```python JSON schema
+schema = {
+    "type": "object",
+    "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+    "required": ["name", "age"],
+}
+structured = model.with_structured_output(schema)
+data = structured.generate([HumanMessage(content="Maria Chen is 42.")])
+data["name"]  # "Maria Chen"
+```
+</CodeGroup>
+
+The schema instruction is built once and cached, so it is not re-serialized on every call. `StructuredOutputModel` also supports `agenerate`, and its `stream`/`astream` yield partial dicts as JSON arrives (pydantic validation applies on `generate`/`agenerate`, not mid-stream).
+
+<Tip>
+`StructuredOutputModel` composes. Call `bind_tools` on it, or chain it with the `|` operator into a runnable, and it still parses the final output.
+</Tip>
+
+## Interchangeable by design
+
+Because every provider satisfies the same protocol, swapping models is a one-line change. The messages you build, the tools you bind, and the structured schemas you attach all stay the same.
+
+```python
+from infy.providers.anthropic import AnthropicChat
+
+model = AnthropicChat("claude-sonnet-4-5")   # same six methods
+reply = model.generate([HumanMessage(content="Hello")])
+```
+
+<CardGroup cols={2}>
+  <Card title="Providers" icon="plug" href="/providers">
+    The OpenAI, Anthropic, Gemini, and Ollama classes and how to configure them.
+  </Card>
+  <Card title="Runnables and chains" icon="link" href="/concepts/composition">
+    Compose models, parsers, and functions with the `|` operator.
+  </Card>
+  <Card title="Agents" icon="robot" href="/concepts/agents">
+    Build tool-calling agents with `create_agent`.
+  </Card>
+  <Card title="Governance" icon="shield" href="/governance/overview">
+    Add deny-by-default policy, approval, and audit around tool calls.
+  </Card>
+</CardGroup>
